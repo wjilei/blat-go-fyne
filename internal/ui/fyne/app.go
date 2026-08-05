@@ -39,6 +39,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image/color"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -161,6 +163,73 @@ func New(title string) *App {
 	return a
 }
 
+// themeColor 把 fyne.ThemeColorName 解析成 color.Color。Fyne v2 的
+// canvas.* 字段类型是 color.Color，而 theme.ColorName* 是 string 别名，
+// 不能直接赋——必须走 Theme().Color(name, variant)。
+func themeColor(name fyne.ThemeColorName) color.Color {
+	return fyne.CurrentApp().Settings().Theme().Color(name, fyne.CurrentApp().Settings().ThemeVariant())
+}
+
+// borderLayout 把第一个对象当 content 排版，第二个对象（通常是画线
+// 的 canvas.Rectangle）铺满整个容器。pad 计入 MinSize。
+type borderLayout struct {
+	padTop, padBottom, padLeft, padRight float32
+}
+
+func (b borderLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	if len(objs) < 2 {
+		return
+	}
+	objs[0].Move(fyne.NewPos(b.padLeft, b.padTop))
+	objs[0].Resize(fyne.NewSize(
+		size.Width-b.padLeft-b.padRight,
+		size.Height-b.padTop-b.padBottom,
+	))
+	objs[1].Resize(size)
+}
+
+func (b borderLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	if len(objs) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	inner := objs[0].MinSize()
+	return fyne.NewSize(
+		inner.Width+b.padLeft+b.padRight,
+		inner.Height+b.padTop+b.padBottom,
+	)
+}
+
+// newBordered 给任意 CanvasObject 包一层指定颜色/线宽的矩形边框。
+// 颜色用 fyne.ThemeColorName，浅色/深色主题自动适配。
+func newBordered(content fyne.CanvasObject, lineColor fyne.ThemeColorName, lineWidth float32) *fyne.Container {
+	rect := canvas.NewRectangle(color.Transparent)
+	rect.StrokeColor = themeColor(lineColor)
+	rect.StrokeWidth = lineWidth
+	return container.New(
+		borderLayout{
+			padLeft: lineWidth, padRight: lineWidth,
+			padTop: lineWidth, padBottom: lineWidth,
+		},
+		content, rect,
+	)
+}
+
+// newBottomBorder 只在 content 下方画一条水平线。
+// 用 layout.BorderLayout 把 canvas.Line 贴底拉伸，content 区域不动。
+func newBottomBorder(content fyne.CanvasObject, lineColor fyne.ThemeColorName, lineWidth float32) *fyne.Container {
+	line := canvas.NewLine(themeColor(lineColor))
+	line.StrokeWidth = lineWidth
+	return container.New(layout.NewBorderLayout(nil, line, nil, nil), content, line)
+}
+
+// newBottomBorder 只在 content 下方画一条水平线。
+// 用 layout.BorderLayout 把 canvas.Line 贴底拉伸，content 区域不动。
+func newTopBorder(content fyne.CanvasObject, lineColor fyne.ThemeColorName, lineWidth float32) *fyne.Container {
+	line := canvas.NewLine(themeColor(lineColor))
+	line.StrokeWidth = lineWidth
+	return container.New(layout.NewBorderLayout(line, nil, nil, nil), content, line)
+}
+
 func (a *App) build() {
 	a.log = widget.NewRichText()
 	a.log.Wrapping = fyne.TextWrapWord
@@ -251,9 +320,9 @@ func (a *App) build() {
 		}
 	})
 
-	tb := container.NewHBox(a.startBtn)
+	tb := newBottomBorder(container.NewHBox(a.startBtn), theme.ColorNameInputBorder, 1)
 
-	statusBar := container.NewHBox(a.status, layout.NewSpacer(), a.prog)
+	statusBar := newTopBorder(container.NewHBox(a.status, layout.NewSpacer(), a.prog), theme.ColorNameInputBorder, 1)
 
 	// 程序主场口，左右两栏，左窄右宽
 	mainFrame := container.NewHSplit(a.tree, a.logScroll)
@@ -462,9 +531,9 @@ func (a *App) startRun() {
 // guiAdapter forwards plan reporter events to the Fyne widgets so the
 // runner only talks to report.Reporter.
 type guiAdapter struct {
-	gui       *App
-	total     int
-	cancelled bool                 // run goroutine 在退出前根据 ctx.Err() 设置
+	gui            *App
+	total          int
+	cancelled      bool                     // run goroutine 在退出前根据 ctx.Err() 设置
 	OnPlanStopHook func(sum report.Summary) // 业务方可选钩子；在 OnPlanStop 顶部调用
 }
 
