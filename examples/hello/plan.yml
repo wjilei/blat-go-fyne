@@ -1,0 +1,19 @@
+# 简单问候示例
+- name: HelloSuite::SayHello
+  title: 招呼
+  case_seq: 1
+  counts: 1
+  desc: 简单问候示例
+  who: World
+- name: HelloSuite::SayBye
+  title: 告别
+  case_seq: 2
+  counts: 1
+  desc: 简单告别示例
+  who: friend
+- name: HelloSuite::FailCase
+  title: 故意失败
+  case_seq: 3
+  counts: 1
+  desc: 演示失败路径
+  reason: demo fail
