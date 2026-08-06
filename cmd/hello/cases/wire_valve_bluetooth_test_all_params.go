@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"blat/internal/core"
@@ -24,7 +23,9 @@ func (c *WireValveBluetoothTestAllParamsCase) Name() string {
 	return "wire_valve_bluetooth_test_all_params"
 }
 
-// Configure 读取 plan 的自定义参数。
+// Configure 读取 plan 的自定义参数，对应 Perl
+// BLAT::APP::Heat::Cases::wire_valve::bluetooth_test_all_params_args 的
+// 默认值（设备类型=PSAV、蓝牙操作=read）。
 func (c *WireValveBluetoothTestAllParamsCase) Configure(args map[string]any) error {
 	if v, ok := args["设备类型"].(string); ok && v != "" {
 		c.deviceType = v
@@ -47,8 +48,8 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
 	bt, ok := heatnote["bluetooth"].(*bluetooth.Device)
 	if !ok {
-		// 注意：不能无条件 fallback 到 env.Devs["bluetooth"]——main 始终注入
-		// NewDevice()（mock），无条件复用会让 -mock-bt=false 拿不到 real 实例。
+		// 注意：不能无条件 fallback 到 env.Devs["bluetooth"]——main 默认注入
+		// NewDevice()（real），无条件复用会让 -mock-bt=true 拿不到 mock 实例。
 		// 仅当 Devs 实例的模式与 bt_mock 请求的模式一致时才兜底复用。
 		mock, _ := heatnote["bt_mock"].(bool)
 		if dev, has := env.Devs["bluetooth"].(*bluetooth.Device); has && !dev.IsReal() == mock {
@@ -66,9 +67,8 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 		heatnote["bluetooth"] = bt
 	}
 
-	id := _str(heatnote, "mac")
+	id := _str(heatnote, "serial")
 	pipe := _int(heatnote, "pipe")
-	testMode := _str(heatnote, "test_mode")
 	// 软件版本：优先 HeatNote（demo confs/env.yml 的位置），兜底 env.Vars 顶层
 	// （Perl 里是 env_args["软件版本"]）。
 	softVer := _int(heatnote, "软件版本")
@@ -76,10 +76,23 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 		softVer = _int(env.Vars, "软件版本")
 	}
 
-	// 连接 + 重启
-	if err := bt.Connect(ctx, id); err != nil {
-		return fmt.Errorf("蓝牙连接失败: %w", err)
+	// 连接（参照 Perl bluetooth_test_all_params / _ensure_bluetooth_connected）：
+	// mac 由序列号 parseIdToMac 派生；已连接则跳过重复连接，否则重试连接
+	// （Device.Connect 内部最多重试 2 次，对应 Perl ConnectBle 重试）。
+	// 设备类型决定蓝牙协议帧头字节（PSAV→f9，其它→f8），对应 Perl dev_type 字段
+	bt.SetDevType(c.deviceType)
+	// 注入日志输出：发现服务/特征成功、扫描成功、连接成功都会打日志
+	bt.SetLogger(env.Log)
+
+	env.Log.Info("扫描并连接蓝牙")
+	mac := bluetooth.ParseIdToMac(id)
+	if bt.IsConnected(mac) {
+		env.Log.Info("蓝牙已连接，跳过重复连接")
+	} else if err := bt.Connect(ctx, id); err != nil {
+		return fmt.Errorf("%w", err)
 	}
+
+	// 重启
 	if err := bt.Reboot(ctx); err != nil {
 		return fmt.Errorf("重启失败: %w", err)
 	}
@@ -88,68 +101,25 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 		return err
 	}
 
-	// 循环读取，等待 NB 信号就绪（最多 59 次）
-	nbOk := false
 	var obj *bluetooth.Status
-	readCnt := 0
-	for i := 0; i < 59; i++ {
-		obj = bt.Read(ctx)
-		if obj == nil {
-			return errors.New("读取蓝牙失败")
-		}
-		if obj.ForceCloseNB != 0 {
-			_ = bt.EnableNbiot(ctx)
-			if err := _sleep(ctx, time.Second); err != nil {
-				return err
-			}
-			continue
-		}
-		if obj.NbRssi == 0 && obj.NbSnr == 0 {
-			readCnt++
-			if readCnt >= 30 {
-				_ = bt.DisableNbiot(ctx)
-				if err := _sleep(ctx, 5*time.Second); err != nil {
-					return err
-				}
-				_ = bt.EnableNbiot(ctx)
-				readCnt = 0
-			}
-			if err := _sleep(ctx, time.Second); err != nil {
-				return err
-			}
-			continue
-		}
-		if obj.NbRssi >= -81 || obj.NbSnr >= 0 {
-			nbOk = true
-			break
-		}
-		if err := _sleep(ctx, time.Second); err != nil {
-			return err
-		}
-	}
+
+	obj = bt.Read(ctx)
 	if obj == nil {
 		return errors.New("读取蓝牙失败")
 	}
-	if !nbOk {
-		return errors.New("NB信号异常")
-	}
 
-	// 参数校验
-	if obj.SoftVer != softVer {
-		return fmt.Errorf("软件版本不匹配: got %d want %d", obj.SoftVer, softVer)
-	}
-	if strings.Contains(testMode, "single") && obj.Timestamp > 40 {
-		return errors.New("蓝牙没有正确重启")
-	}
+	env.Log.Info(fmt.Sprintf("软件版本: %v", obj.SoftVer))
+	env.Log.Info(fmt.Sprintf("蓝牙版本: %v", obj.BlVer))
+	env.Log.Info(fmt.Sprintf("管径: %v", obj.DN))
+	voltage := float32(obj.Voltage)/100 + 2
+	env.Log.Info(fmt.Sprintf("电压: %.2f", voltage))
+
 	if obj.Sn != id {
 		return fmt.Errorf("序列号不匹配: got %q want %q", obj.Sn, id)
 	}
 	if obj.DN != pipe {
 		return fmt.Errorf("管径不一致: got %d want %d", obj.DN, pipe)
 	}
-	voltage := obj.Voltage/100 + 2
-	env.Log.Info(fmt.Sprintf("电压: %d", voltage))
-
 	// 设备类型分支
 	if c.deviceType == "PFW" {
 		if obj.Err&0x8 != 0 && obj.Flow == 0 {

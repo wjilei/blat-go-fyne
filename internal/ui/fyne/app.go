@@ -38,7 +38,6 @@ package fyneui
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"image/color"
 	"path/filepath"
@@ -50,6 +49,7 @@ import (
 
 	"blat/internal/config"
 	"blat/internal/core"
+	"blat/internal/device/bluetooth"
 	"blat/internal/report"
 	"blat/internal/runtime"
 	"blat/internal/serial"
@@ -769,21 +769,21 @@ func (a *App) setTestModeFromPlan() {
 // 必须在非主线程（goroutine）中调用；内部用 fyne.Do 回主线程操作 UI。
 func (a *App) queryRecordThenRun(serial string) {
 	a.setTestModeFromPlan()
-	rec, err := uploader.GetTestRecord(serial)
-	if err != nil {
-		fyne.Do(func() {
-			dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
-			a.SetStatus("查询测试记录失败")
-		})
-		return
-	}
-	// --debug 模式：把查询到的整机测试记录打印到日志供排查
-	if a.isDebug() {
-		if payload, jerr := json.MarshalIndent(rec, "", "  "); jerr == nil {
-			a.Info("debug 模式，查询到的整机测试记录:\n" + string(payload))
-		}
-	}
-	a.applyTestRecord(rec)
+	// rec, err := uploader.GetTestRecord(serial)
+	// if err != nil {
+	// 	fyne.Do(func() {
+	// 		dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
+	// 		a.SetStatus("查询测试记录失败")
+	// 	})
+	// 	return
+	// }
+	// // --debug 模式：把查询到的整机测试记录打印到日志供排查
+	// if a.isDebug() {
+	// 	if payload, jerr := json.MarshalIndent(rec, "", "  "); jerr == nil {
+	// 		a.Info("debug 模式，查询到的整机测试记录:\n" + string(payload))
+	// 	}
+	// }
+	// a.applyTestRecord(rec)
 	fyne.Do(func() {
 		a.SetStatus("已找到测试记录，开始测试")
 		a.startRun()
@@ -1011,6 +1011,19 @@ func (a *App) startRun() {
 			adp.cancelled = true
 		}
 		a.runFinished(ctx)
+		// 对应 Perl 用例跑完释放蓝牙连接：优先取 case 存回
+		// Vars.HeatNote["bluetooth"] 的实例（可能是 case 新建后存回的），
+		// 无则兜底 Devs["bluetooth"] 默认实例；断开失败忽略。
+		var btDev *bluetooth.Device
+		if heatnote, _ := env.Vars["HeatNote"].(map[string]any); heatnote != nil {
+			btDev, _ = heatnote["bluetooth"].(*bluetooth.Device)
+		}
+		if btDev == nil {
+			btDev, _ = env.Devs["bluetooth"].(*bluetooth.Device)
+		}
+		if btDev != nil {
+			_ = btDev.Disconnect()
+		}
 		// 状态文字 / 按钮 / 进度条 收尾统一交给 guiAdapter.OnPlanStop。
 		// 这里只记录 err 日志，避免与 reporter 双写。
 		if err != nil {

@@ -4,15 +4,18 @@ go 1.25.0
 
 require (
 	fyne.io/fyne/v2 v2.8.0
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
+	github.com/fxamacker/cbor/v2 v2.9.2
+	github.com/ulikunitz/xz v0.5.16
 	golang.org/x/sys v0.43.0
 	gopkg.in/yaml.v3 v3.0.1
+	tinygo.org/x/bluetooth v0.15.0
 )
 
 require (
 	fyne.io/systray v1.12.2 // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/FyshOS/fancyfs v0.0.1 // indirect
-	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible // indirect
 	github.com/anthonynsimon/bild v0.14.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -47,12 +50,11 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tinygo-org/cbgo v0.0.4 // indirect
 	github.com/tinygo-org/pio v0.3.0 // indirect
-	github.com/ulikunitz/xz v0.5.16 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
 	golang.org/x/exp v0.0.0-20241204233417-43b7b7cde48d // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	tinygo.org/x/bluetooth v0.15.0 // indirect
 )

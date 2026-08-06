@@ -69,7 +69,7 @@ func (t *TAPReporter) OnPlanStop(summary Summary) {
 // spaces per the specification.
 func (t *TAPReporter) writeDiagnostic(msg string) {
 	msg = strings.ReplaceAll(msg, "'", "''")
-	fmt.Fprintf(t.w, "  ---\n  message: '%s'\n  ...\n", msg)
+	fmt.Fprintf(t.w, "  ---\n  '%s'\n  ...\n", msg)
 }
 
 // tapEscape neutralises '#' which terminates a TAP description early.

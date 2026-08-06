@@ -65,7 +65,7 @@ func main() {
 	planPath := flag.String("plan", "", "path to plan YAML; 留空则不预选计划（下拉框停在\"请选择测试计划\"），-no-gui 模式必须提供")
 	envPath := flag.String("env", "confs/env.yml", "path to vars YAML (e.g. MBUS port); 缺文件忽略")
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
-	mockBT := flag.Bool("mock-bt", true, "use mock bluetooth (no hardware); set false for real BLE")
+	mockBT := flag.Bool("mock-bt", false, "use mock bluetooth (no hardware); 默认 false 走真实 BLE")
 	debug := flag.Bool("debug", false, "debug 模式：不实际上传 OSS / 保存数据库，把要上报的数据打印到日志")
 	flag.Parse()
 
@@ -155,9 +155,27 @@ func runConsole(plan *config.Plan, vars map[string]any, debug bool) int {
 	)
 	if err := pr.RunPlan(context.Background(), plan, env, rep); err != nil {
 		fmt.Fprintln(os.Stderr, "FAIL:", err)
+		disconnectBluetooth(env)
 		return 1
 	}
+	// 对应 Perl 用例跑完释放蓝牙连接
+	disconnectBluetooth(env)
 	return 0
+}
+
+// disconnectBluetooth 释放 plan 跑完后遗留的蓝牙连接（对应 Perl 用例跑完
+// 释放蓝牙连接）。优先取 case 存回 Vars.HeatNote["bluetooth"] 的实例（可能
+// 是 case 新建后存回的），无则兜底 Devs["bluetooth"] 默认实例；断开失败忽略。
+func disconnectBluetooth(env *core.Env) {
+	if heatnote, _ := env.Vars["HeatNote"].(map[string]any); heatnote != nil {
+		if dev, ok := heatnote["bluetooth"].(*bluetooth.Device); ok {
+			_ = dev.Disconnect()
+			return
+		}
+	}
+	if dev, ok := env.Devs["bluetooth"].(*bluetooth.Device); ok {
+		_ = dev.Disconnect()
+	}
 }
 
 func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, debug bool) int {
