@@ -137,7 +137,6 @@ type App struct {
 	logBuf     []logEntry
 	logCap     int
 	cat        string
-	serNum     string // 启动弹框输入的序列号，受 mu 保护
 
 	promptCh  chan promptReq
 	confirmCh chan confirmReq
@@ -682,6 +681,23 @@ func (a *App) setPlanVar(path string) {
 	a.env.Vars["HeatNote"] = hn
 }
 
+// setSerialVar 把启动弹框输入的序列号写入 env.Vars["HeatNote"]["serial"]，
+// 供 case 运行时读取。env 尚未 Attach 时直接返回。该值是临时运行状态，
+// 不随配置落盘持久化（与 plan 一致）。
+func (a *App) setSerialVar(serial string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.env == nil {
+		return
+	}
+	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		hn = map[string]any{}
+	}
+	hn["serial"] = serial
+	a.env.Vars["HeatNote"] = hn
+}
+
 // promptConfig 弹出配置表单：当前只有一项——MBUS 串口下拉框。
 //
 // 数据流：
@@ -793,7 +809,7 @@ var serialFormatRe = regexp.MustCompile(`^W?\d{12}`)
 
 // promptSerialThenRun 弹出一个输入框让用户填序列号，回车或点"确定"都会
 // 触发格式校验，校验通过后启动 startRun；取消或校验失败则保持弹框直到
-// 用户改对。序列号存到 a.serNum 备用。
+// 用户改对。序列号写入 env.Vars["HeatNote"]["serial"] 供 case 使用。
 //
 // 不用 dialog.NewCustom / NewCustomConfirm：前者即便 dismissText 为空也
 // 会渲染一个空按钮占位栏（"第三个空按钮"的来源），后者在点"确定"后必
@@ -822,9 +838,7 @@ func (a *App) promptSerialThenRun() {
 			if popup != nil {
 				popup.Hide()
 			}
-			a.mu.Lock()
-			a.serNum = text
-			a.mu.Unlock()
+			a.setSerialVar(text)
 			a.startRun()
 			return
 		}
