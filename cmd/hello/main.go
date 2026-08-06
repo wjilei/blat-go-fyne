@@ -67,7 +67,21 @@ func main() {
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
 	mockBT := flag.Bool("mock-bt", false, "use mock bluetooth (no hardware); 默认 false 走真实 BLE")
 	debug := flag.Bool("debug", false, "debug 模式：不实际上传 OSS / 保存数据库，把要上报的数据打印到日志")
+	uploaderPath := flag.String("uploader", "confs/uploader.yml", "path to uploader credentials YAML")
 	flag.Parse()
+
+	// 上报凭据配置（OSS 日志上传 + BLAT 后台存库）：从 YAML 加载并注入
+	// uploader 包。凭据是必需的，缺文件或解析失败直接退出，不构造有效
+	// 上报请求继续跑。
+	ucfg, err := config.LoadUploader(*uploaderPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "load uploader config:", err)
+		os.Exit(2)
+	}
+	uploader.Init(uploader.Config{
+		OSS:  uploader.OSSConfig{AccessID: ucfg.OSS.AccessID, SecretKey: ucfg.OSS.SecretKey, Host: ucfg.OSS.Host, LogBucket: ucfg.OSS.LogBucket},
+		Blat: uploader.BlatConfig{BaseURL: ucfg.Blat.BaseURL, Token: ucfg.Blat.Token},
+	})
 
 	// 组装下拉框计划列表：内置列表 + （若 --plan 指定了列表外的文件）额外项。
 	items := append([]fyneui.PlanItem(nil), builtinPlans...)

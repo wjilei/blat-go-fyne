@@ -1,6 +1,9 @@
 // Package uploader 提供测试全部跑完后的上报逻辑：把运行日志压缩上传阿里云 OSS，
 // 并把测试记录 POST 到 BLAT 服务器数据库。对应 BLAT Perl 版 BlatServer.pm 的
 // hook_stop + send_report_to_oss + HeatSaveTestData。
+//
+// 上报所需的 OSS 凭据与 BLAT 后台 token 从配置文件加载（config.LoadUploader
+// 读取 confs/uploader.yml 后经 uploader.Init 注入），不再硬编码在代码里。
 package uploader
 
 import (
@@ -19,16 +22,29 @@ import (
 	"blat/internal/report"
 )
 
-// 硬编码常量，对应 BLAT::Common::Utils / BlatServer.pm 中的配置。
-const (
-	ossAccessID       = "***REMOVED***"
-	ossSecretKey      = "***REMOVED***"
-	ossHost           = "oss-cn-hangzhou.aliyuncs.com"
-	ossLogBucket      = "blat-app-log"
-	blatServerBaseURL = "https://blat.poersmart.com"
-	blatServerToken   = "***REMOVED***"
-	devTypeHeat       = "2"
-)
+// devTypeHeat 是整机测试记录查询使用的设备类型（对应 HeatGetTestRecord），
+// 属逻辑常量，保留在代码里。
+const devTypeHeat = "2"
+
+// Config 是上报所需的凭据配置，由 config.LoadUploader 从 YAML 加载后经 Init 注入。
+type Config struct {
+	OSS  OSSConfig
+	Blat BlatConfig
+}
+
+type OSSConfig struct {
+	AccessID, SecretKey, Host, LogBucket string
+}
+
+type BlatConfig struct {
+	BaseURL, Token string
+}
+
+// 包级配置；Init 前为空，调用 UploadLogOSS / SaveTestData / GetTestRecord 会失败或构造空凭据。
+var cfg Config
+
+// Init 用配置文件中的凭据初始化包级配置，必须在上述函数被调用前执行一次。
+func Init(c Config) { cfg = c }
 
 // httpClient 是共享的 HTTP 客户端；带超时防止请求挂死导致程序退出时卡住。
 var httpClient = &http.Client{Timeout: 15 * time.Second}
@@ -61,10 +77,10 @@ func UploadLogOSS(ossPath string, content []byte) error {
 	var lastErr error
 	lastFail := time.Time{}
 	for attempt := 1; attempt <= maxRetry; attempt++ {
-		client, err := oss.New("https://"+ossHost, ossAccessID, ossSecretKey)
+		client, err := oss.New("https://"+cfg.OSS.Host, cfg.OSS.AccessID, cfg.OSS.SecretKey)
 		if err == nil {
 			var bucket *oss.Bucket
-			bucket, err = client.Bucket(ossLogBucket)
+			bucket, err = client.Bucket(cfg.OSS.LogBucket)
 			if err == nil {
 				err = bucket.PutObject(ossPath, bytes.NewReader(content))
 			}
@@ -103,7 +119,7 @@ func SaveTestData(data map[string]any, devType string) error {
 		return err
 	}
 
-	url := blatServerBaseURL + "/v1/tests/records?dev_type=" + devType
+	url := cfg.Blat.BaseURL + "/v1/tests/records?dev_type=" + devType
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		err := postJSON(url, payload)
@@ -132,7 +148,7 @@ func postJSON(url string, payload []byte) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+blatServerToken)
+	req.Header.Set("Authorization", "Bearer "+cfg.Blat.Token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -196,7 +212,7 @@ func GetTestRecord(serialNum string) (map[string]any, error) {
 	params.Set("serial_num", serialNum)
 	params.Set("test_mode", "normal")
 	params.Set("test_result", "1")
-	full := blatServerBaseURL + "/v1/tests/query/info?" + params.Encode()
+	full := cfg.Blat.BaseURL + "/v1/tests/query/info?" + params.Encode()
 
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -232,7 +248,7 @@ func getJSON(url string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+blatServerToken)
+	req.Header.Set("Authorization", "Bearer "+cfg.Blat.Token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
