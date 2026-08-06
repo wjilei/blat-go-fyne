@@ -40,6 +40,7 @@ import (
 	"context"
 	"fmt"
 	"image/color"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,8 @@ const defaultLogCap = 1000
 const (
 	nodePlan    = "__plan__"
 	nodeCasePfx = "case:"
+	// planPlaceholder 是计划下拉框的第一个选项；选中它表示不选任何计划。
+	planPlaceholder = "请选择测试计划"
 )
 
 type row struct {
@@ -75,6 +78,12 @@ type row struct {
 	name   string
 	result string
 	detail string
+}
+
+// PlanItem 是计划下拉框里的一个选项：显示名 + 对应的 plan.yml 路径。
+type PlanItem struct {
+	Name string // 下拉框显示名
+	Path string // plan.yml 路径（相对工作目录）
 }
 
 // logEntry is one ring-buffer record. The widget renders one colored
@@ -113,6 +122,8 @@ type App struct {
 	prog      *widget.ProgressBar
 	startBtn  *widget.Button
 	configBtn *widget.Button
+	planSel   *widget.Select // 测试计划下拉框
+	planItems []PlanItem     // 下拉框选项（显示名→plan.yml 路径），受 mu 保护
 
 	// varsFile 是配置（MBUS 串口等）持久化的目标文件路径；相对工作目录。
 	// 启动时 main 用 config.LoadEnv(varsFile) 读入 env.Vars，配置弹框
@@ -355,7 +366,14 @@ func (a *App) build() {
 		a.promptConfig()
 	})
 
-	tb := newBottomBorder(container.NewHBox(a.startBtn, a.configBtn), theme.ColorNameInputBorder, 1)
+	// 测试计划下拉框：第一项固定为"请选择测试计划"（等价于未选择计划），
+	// 选项列表由 main 通过 SetPlanList 注入。
+	a.planSel = widget.NewSelect([]string{planPlaceholder}, func(name string) {
+		a.onPlanSelected(name)
+	})
+	a.planSel.PlaceHolder = planPlaceholder
+
+	tb := newBottomBorder(container.NewHBox(a.startBtn, a.configBtn, a.planSel), theme.ColorNameInputBorder, 1)
 
 	statusBar := newTopBorder(container.NewHBox(a.status, layout.NewSpacer(), a.prog), theme.ColorNameInputBorder, 1)
 
@@ -487,10 +505,7 @@ func (a *App) Attach(plan *config.Plan, env *core.Env, reg *runtime.Registry) {
 // loadPlan opens a file picker for a YAML plan, reloads it and resets the
 // case tree. If a run is in flight it is stopped first.
 func (a *App) loadPlan() {
-	if a.running() {
-		a.StopRun()
-		a.Warn("已停止当前运行，请重新选择 plan")
-	}
+	a.stopIfRunning()
 	fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil {
 			a.Error("open plan: " + err.Error())
@@ -522,6 +537,126 @@ func (a *App) loadPlan() {
 	}, a.win)
 	fd.SetFilter(storage.NewExtensionFileFilter([]string{".yml", ".yaml"}))
 	fd.Show()
+}
+
+// stopIfRunning 若正在运行则先停止并提示。切换/清空 plan 前调用。
+func (a *App) stopIfRunning() {
+	if a.running() {
+		a.StopRun()
+		a.Warn("已停止当前运行，请重新选择 plan")
+	}
+}
+
+// SetPlanList 注入下拉框的计划选项并设置初始选中项。
+//
+// selectPath 为空时停留在"请选择测试计划"（即不选任何计划，左侧树为空）；
+// 非空时按路径匹配选项并触发加载。必须放在 Attach 之后、Run 之前调用——
+// 设置初始选中会触发计划加载，加载逻辑需要 a.env 写入 env.Vars 的计划路径。
+func (a *App) SetPlanList(items []PlanItem, selectPath string) {
+	a.mu.Lock()
+	a.planItems = append([]PlanItem(nil), items...)
+	opts := make([]string, 0, len(items)+1)
+	opts = append(opts, planPlaceholder)
+	for _, it := range items {
+		opts = append(opts, it.Name)
+	}
+	a.mu.Unlock()
+
+	a.planSel.SetOptions(opts)
+	idx := 0
+	if selectPath != "" {
+		for i, it := range items {
+			if filepath.Clean(it.Path) == filepath.Clean(selectPath) {
+				idx = i + 1
+				break
+			}
+		}
+	}
+	a.planSel.SetSelectedIndex(idx)
+}
+
+// onPlanSelected 是下拉框的回调：选中某个测试计划则加载并填入左侧树，
+// 选中占位项"请选择测试计划"则清空 plan 与树。
+func (a *App) onPlanSelected(name string) {
+	if name == "" || name == planPlaceholder {
+		a.clearPlan()
+		return
+	}
+	path := a.planPath(name)
+	if path == "" {
+		a.Warn("未知计划: " + name)
+		return
+	}
+	a.loadPlanByPath(path)
+}
+
+// planPath 按显示名查 plan.yml 路径。
+func (a *App) planPath(name string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, it := range a.planItems {
+		if it.Name == name {
+			return it.Path
+		}
+	}
+	return ""
+}
+
+// loadPlanByPath 加载 plan.yml：清空并重建左侧用例树，把计划文件路径写入
+// env.Vars["HeatNote"]["plan"] 供 case 运行时做判断。
+func (a *App) loadPlanByPath(path string) {
+	a.stopIfRunning()
+	plan, err := config.LoadPlan(path)
+	if err != nil {
+		a.Error(err.Error())
+		return
+	}
+	a.mu.Lock()
+	a.plan = plan
+	a.rows = a.rows[:0]
+	a.mu.Unlock()
+	a.tree.Refresh()
+	for _, c := range plan.Cases {
+		title := c.Title
+		if title == "" {
+			title = c.Name
+		}
+		a.AddRow(title, c.Name)
+	}
+	a.setPlanVar(path)
+	a.SetStatus("loaded " + path)
+}
+
+// clearPlan 清空当前 plan 与用例树（下拉框停在"请选择测试计划"）。
+func (a *App) clearPlan() {
+	a.stopIfRunning()
+	a.mu.Lock()
+	a.plan = nil
+	a.rows = a.rows[:0]
+	a.mu.Unlock()
+	a.tree.Refresh()
+	a.setPlanVar("")
+	a.SetStatus("未选择测试计划")
+}
+
+// setPlanVar 把当前计划文件路径写入 env.Vars["HeatNote"]["plan"]；
+// path 为空时删除该键。env 尚未 Attach 时直接返回。
+func (a *App) setPlanVar(path string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.env == nil {
+		return
+	}
+	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		hn = map[string]any{}
+	}
+	if path == "" {
+		delete(hn, "plan")
+	} else {
+		hn["plan"] = path
+	}
+	a.env.Vars["HeatNote"] = hn
 }
 
 // promptConfig 弹出配置表单：当前只有一项——MBUS 串口下拉框。
@@ -616,8 +751,13 @@ func (a *App) applyMBUSPort(port string) {
 	a.mu.Unlock()
 
 	// 落盘前剔除不可序列化的运行时对象（如 Vars.HeatNote["bluetooth"] 里的
-	// *bluetooth.Device），否则 yaml.Marshal 会失败。
-	if err := config.SaveEnv(path, config.CleanVars(a.env.Vars, "bluetooth")); err != nil {
+	// *bluetooth.Device），否则 yaml.Marshal 会失败。HeatNote.plan 是当前
+	// 下拉框选中的计划路径，属临时运行状态，不随配置落盘持久化。
+	clean := config.CleanVars(a.env.Vars, "bluetooth")
+	if hn, ok := clean["HeatNote"].(map[string]any); ok {
+		delete(hn, "plan")
+	}
+	if err := config.SaveEnv(path, clean); err != nil {
 		dialog.ShowError(fmt.Errorf("保存 %s 失败: %w", path, err), a.win)
 		return
 	}

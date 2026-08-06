@@ -5,10 +5,15 @@
 // console UI instead (useful in CI / headless boxes). Pass --env to load
 // a YAML env file into Env.Vars (e.g. confs/env.yml for the Heat demo).
 //
+// 工具栏"配置"按钮后有一个测试计划下拉框（选项见 builtinPlans），选中的
+// plan.yml 路径会写入 env.Vars["HeatNote"]["plan"] 供 case 运行时判断。
+// --plan 指定计划文件时，下拉框默认选中对应项；文件不在内置列表里会被
+// 追加为额外选项。未传 --plan 时下拉框停在"请选择测试计划"，左侧树为空。
+//
 // Startup order for the GUI mode:
 //  1. Build fyne UI (creates widgets, starts pump goroutine).
-//  2. Pre-fill case tree.
-//  3. Hand the plan/env/registry to the UI via gui.Attach.
+//  2. Hand env/registry to the UI via gui.Attach（plan 由下拉框接管，传 nil）。
+//  3. gui.SetPlanList 注入计划选项并设置初始选中项（--plan 指定时预选对应项）。
 //  4. Call gui.Run() which blocks on the Fyne event loop until the user
 //     closes the window.
 //
@@ -23,6 +28,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"blat/cmd/hello/cases"
 	"blat/internal/config"
@@ -34,21 +40,51 @@ import (
 	fyneui "blat/internal/ui/fyne"
 )
 
+// builtinPlans 是测试计划下拉框的内置选项。每项对应一个 plan.yml 文件，
+// 显示名按产线实际计划自定义；新增计划只需在此追加一项。
+var builtinPlans = []fyneui.PlanItem{
+	{Name: "默认计划", Path: "confs/plan.yml"},
+	{Name: "Heat 蓝牙示例", Path: "examples/heat/plan.yml"},
+	{Name: "Hello 问候示例", Path: "examples/hello/plan.yml"},
+}
+
+// planInList 报告 path 是否已存在于 items（按规范化路径比较）。
+func planInList(items []fyneui.PlanItem, path string) bool {
+	clean := filepath.Clean(path)
+	for _, it := range items {
+		if filepath.Clean(it.Path) == clean {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
-	planPath := flag.String("plan", "confs/plan.yml", "path to plan YAML")
+	planPath := flag.String("plan", "", "path to plan YAML; 留空则不预选计划（下拉框停在\"请选择测试计划\"），-no-gui 模式必须提供")
 	envPath := flag.String("env", "confs/env.yml", "path to vars YAML (e.g. MBUS port); 缺文件忽略")
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
 	mockBT := flag.Bool("mock-bt", true, "use mock bluetooth (no hardware); set false for real BLE")
 	flag.Parse()
 
-	plan, err := config.LoadPlan(*planPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "load plan:", err)
-		os.Exit(2)
-	}
-	if len(plan.Cases) == 0 {
-		fmt.Fprintln(os.Stderr, "plan has no cases:", *planPath)
-		os.Exit(2)
+	// 组装下拉框计划列表：内置列表 + （若 --plan 指定了列表外的文件）额外项。
+	items := append([]fyneui.PlanItem(nil), builtinPlans...)
+	selectPath := ""
+	var plan *config.Plan
+	if *planPath != "" {
+		p, err := config.LoadPlan(*planPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "load plan:", err)
+			os.Exit(2)
+		}
+		if len(p.Cases) == 0 {
+			fmt.Fprintln(os.Stderr, "plan has no cases:", *planPath)
+			os.Exit(2)
+		}
+		plan = p
+		selectPath = *planPath
+		if !planInList(items, *planPath) {
+			items = append(items, fyneui.PlanItem{Name: filepath.Base(*planPath), Path: *planPath})
+		}
 	}
 
 	vars := map[string]any{}
@@ -76,10 +112,22 @@ func main() {
 	}
 	heatnote["bt_mock"] = *mockBT
 
+	// 当前计划文件路径写入 env.Vars["HeatNote"]["plan"]，case 运行时据此
+	// 做计划判断；未传 --plan 时删除历史残留键（GUI 模式由下拉框接管该值）。
+	if *planPath != "" {
+		heatnote["plan"] = *planPath
+	} else {
+		delete(heatnote, "plan")
+	}
+
 	if *noGUI {
+		if plan == nil {
+			fmt.Fprintln(os.Stderr, "-no-gui 模式必须用 --plan 指定计划文件")
+			os.Exit(2)
+		}
 		os.Exit(runConsole(plan, vars))
 	}
-	os.Exit(runGUI(plan, *planPath, vars))
+	os.Exit(runGUI(items, selectPath, vars))
 }
 
 func runConsole(plan *config.Plan, vars map[string]any) int {
@@ -102,18 +150,8 @@ func runConsole(plan *config.Plan, vars map[string]any) int {
 	return 0
 }
 
-func runGUI(plan *config.Plan, planPath string, vars map[string]any) int {
-	gui := fyneui.New("blat-go hello - " + planPath)
-
-	// Pre-fill case tree.
-	for _, c := range plan.Cases {
-		title := c.Title
-		if title == "" {
-			title = c.Name
-		}
-		gui.AddRow(title, c.Name)
-	}
-	gui.SetStatus("loaded " + planPath + ", press Start to run")
+func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any) int {
+	gui := fyneui.New("blat-go hello")
 
 	env := &core.Env{
 		Ctx:  context.Background(),
@@ -125,10 +163,10 @@ func runGUI(plan *config.Plan, planPath string, vars map[string]any) int {
 	}
 	reg := cases.Global()
 
-	// Hand the runnable pieces to the UI; the toolbar Start button drives
-	// the runner from there (the UI's own startRun builds the report
-	// chain). We no longer start the runner at boot.
-	gui.Attach(plan, env, reg)
+	// plan 的生命周期由下拉框接管：Attach 时 plan 传 nil，下拉框选中/清空
+	// 时由 GUI 内部加载计划、重建用例树并写入 env.Vars["HeatNote"]["plan"]。
+	gui.Attach(nil, env, reg)
+	gui.SetPlanList(items, selectPath)
 
 	// Block on the Fyne event loop. Closing the window cancels any
 	// in-flight run via the SetOnClosed hook inside fyneui.New.
