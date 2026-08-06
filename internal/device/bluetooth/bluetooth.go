@@ -109,7 +109,7 @@ type Device struct {
 // NewDevice returns a device pre-loaded with pass-through mock data.
 // 等价 NewMockDevice，保持向后兼容（main 现有两处调用不变）。
 func NewDevice() *Device {
-	return NewMockDevice()
+	return NewRealDevice()
 }
 
 // NewMockDevice 返回 mock 模式设备：所有调用走内存数据，无需硬件。

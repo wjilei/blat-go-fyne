@@ -122,3 +122,33 @@ func TestLoadEnv_FileMissing(t *testing.T) {
 		t.Fatal("want error for missing file")
 	}
 }
+
+func TestTestModeFromPlanPath(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		// PSAV / PFW 计划文件名：取 PSAV_/PFW_ 后到 .yml 前的内容作为 test_mode
+		{"confs/plan_PSAV_ut_check_state.yml", "ut_check_state"},
+		{"confs/plan_PSAV_ut_resetvalve.yml", "ut_resetvalve"},
+		{"confs/plan_PSAV_ut_set_dn.yml", "ut_set_dn"},
+		{"confs/plan_PFW_ut_check_state.yml", "ut_check_state"},
+		// 纯文件名（无目录前缀）
+		{"PSAV_normal.yml", "normal"},
+		{"PFW_single.yml", "single"},
+		// 大小写不敏感
+		{"plan_psav_ut_normal.yml", "ut_normal"},
+		// 不匹配的路径：返回空串
+		{"confs/plan.yml", ""},
+		{"examples/hello/plan.yml", ""},
+		{"examples/heat/plan.yml", ""},
+		{"", ""},
+		{"confs/plan_PSAVX.yml", ""}, // PSAV 后没有下划线
+	}
+	for _, c := range cases {
+		if got := TestModeFromPlanPath(c.path); got != c.want {
+			t.Errorf("TestModeFromPlanPath(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+

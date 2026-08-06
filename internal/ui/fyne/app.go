@@ -38,6 +38,7 @@ package fyneui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"path/filepath"
@@ -52,6 +53,7 @@ import (
 	"blat/internal/report"
 	"blat/internal/runtime"
 	"blat/internal/serial"
+	"blat/internal/uploader"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -150,6 +152,10 @@ type App struct {
 	plan *config.Plan
 	env  *core.Env
 	reg  *runtime.Registry
+
+	// debug 为 true 时（--debug）：跳过日志上传 OSS，日志以原始文本随
+	// 测试记录存库。供 hook_stop 上报逻辑读取。
+	debug bool
 }
 
 // New constructs and shows the main window. Call Run to start the Fyne
@@ -524,6 +530,21 @@ func (a *App) Attach(plan *config.Plan, env *core.Env, reg *runtime.Registry) {
 	a.mu.Unlock()
 }
 
+// SetDebug 设置 --debug 模式：不上传 OSS、不保存数据库，把要上报的数据
+// 打印到日志供排查。供 main 在启动时调用；影响下一次运行的 hook_stop 上报行为。
+func (a *App) SetDebug(debug bool) {
+	a.mu.Lock()
+	a.debug = debug
+	a.mu.Unlock()
+}
+
+// isDebug 返回当前是否处于 --debug 模式（供 goroutine 中安全读取）。
+func (a *App) isDebug() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.debug
+}
+
 // loadPlan opens a file picker for a YAML plan, reloads it and resets the
 // case tree. If a run is in flight it is stopped first.
 func (a *App) loadPlan() {
@@ -698,6 +719,77 @@ func (a *App) setSerialVar(serial string) {
 	a.env.Vars["HeatNote"] = hn
 }
 
+// applyTestRecord 把开始测试前查询到的整机测试记录字段写入
+// env.Vars["HeatNote"]，供本次测试的 case 与 hook_stop 上报使用。
+// 与 setSerialVar 一样是临时运行状态，不随配置落盘持久化。
+func (a *App) applyTestRecord(rec map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.env == nil {
+		return
+	}
+	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		hn = map[string]any{}
+	}
+	for _, k := range []string{"pn", "lot", "model", "user", "test_type", "tenant_id"} {
+		if v, ok := rec[k]; ok {
+			hn[k] = v
+		}
+	}
+	a.env.Vars["HeatNote"] = hn
+}
+
+// setTestModeFromPlan 从当前计划文件名解析测试模式：匹配 PSAV_(XXX).yml /
+// PFW_(XXX).yml，把括号里的内容写入 env.Vars["HeatNote"]["test_mode"]。
+// 计划路径取 env.Vars["HeatNote"]["plan"]（由 setPlanVar 在加载计划时写入）；
+// 不匹配模式时不改动 test_mode（保留原值）。与 setSerialVar 一样属临时运行状态。
+func (a *App) setTestModeFromPlan() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.env == nil {
+		return
+	}
+	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		return
+	}
+	path, _ := hn["plan"].(string)
+	mode := config.TestModeFromPlanPath(path)
+	if mode == "" {
+		return
+	}
+	hn["test_mode"] = mode
+}
+
+// queryRecordThenRun 在 goroutine 中按序列号查询整机测试记录
+// （test_mode=normal、test_result=1，对应 BLAT HeatGetTestRecord）。
+// 查不到记录或查询失败则弹错误提示、不启动测试；查到了把记录的
+// pn/lot/model/user/test_type/tenant_id 字段写入 HeatNote 后启动测试。
+// 必须在非主线程（goroutine）中调用；内部用 fyne.Do 回主线程操作 UI。
+func (a *App) queryRecordThenRun(serial string) {
+	a.setTestModeFromPlan()
+	rec, err := uploader.GetTestRecord(serial)
+	if err != nil {
+		fyne.Do(func() {
+			dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
+			a.SetStatus("查询测试记录失败")
+		})
+		return
+	}
+	// --debug 模式：把查询到的整机测试记录打印到日志供排查
+	if a.isDebug() {
+		if payload, jerr := json.MarshalIndent(rec, "", "  "); jerr == nil {
+			a.Info("debug 模式，查询到的整机测试记录:\n" + string(payload))
+		}
+	}
+	a.applyTestRecord(rec)
+	fyne.Do(func() {
+		a.SetStatus("已找到测试记录，开始测试")
+		a.startRun()
+	})
+}
+
 // promptConfig 弹出配置表单：当前只有一项——MBUS 串口下拉框。
 //
 // 数据流：
@@ -839,7 +931,8 @@ func (a *App) promptSerialThenRun() {
 				popup.Hide()
 			}
 			a.setSerialVar(text)
-			a.startRun()
+			a.SetStatus("正在查询测试记录: " + text)
+			go a.queryRecordThenRun(text)
 			return
 		}
 		// 校验失败：popup 保持显示，重新聚焦 entry 便于重输。
@@ -907,6 +1000,10 @@ func (a *App) startRun() {
 			report.NewYAMLPath("report.yml"), // 固定文件名 + 每次开始时清空
 			report.NewTAP(&tapWriter{a: a}),  // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
 			adp,
+			// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
+			// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。
+			// 日志取 GUI 环形缓冲的完整快照；--debug 时不触网，仅打印上报数据。
+			uploader.NewHookStop(env, a.SnapshotLog, a.debug),
 		)
 		err := pr.RunPlan(ctx, plan, env, rep)
 		// 在调 runFinished（清掉 runCtx）前标记取消态，OnPlanStop 仍能读到。
@@ -1094,6 +1191,20 @@ func (a *App) category() string {
 		return "APP"
 	}
 	return a.cat
+}
+
+// SnapshotLog 返回环形缓冲中当前全部日志行（按时间顺序，每行以换行结尾）。
+// 供上报逻辑（hook_stop 上传 OSS/存库）在计划结束后取完整日志使用。
+// 加锁拷贝，可安全地从 runner goroutine 调用。
+func (a *App) SnapshotLog() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var b strings.Builder
+	for _, e := range a.logBuf {
+		b.WriteString(e.Text)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func (a *App) clearLog() {

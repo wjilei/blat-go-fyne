@@ -18,9 +18,29 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 
 	"gopkg.in/yaml.v3"
 )
+
+// planModeRe 匹配计划文件名中的测试模式：形如 PSAV_<mode>.yml / PFW_<mode>.yml
+// （允许 plan_ 等前缀，大小写不敏感）。捕获组 1 是 PSAV_/PFW_ 后到 .yml 前的内容。
+var planModeRe = regexp.MustCompile(`(?i)(?:PSAV|PFW)_(.+)\.ya?ml$`)
+
+// TestModeFromPlanPath 从计划文件名解析测试模式：匹配 PSAV_(XXX).yml /
+// PFW_(XXX).yml，返回括号里的 XXX 作为 test_mode；不匹配时返回空串。
+// 例如 confs/plan_PSAV_ut_check_state.yml → "ut_check_state"。
+func TestModeFromPlanPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	m := planModeRe.FindStringSubmatch(filepath.Base(path))
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
+}
 
 // reserved fields are decoded into the struct; everything else lands in
 // Args. Keep this list in sync with the doc-comment above.

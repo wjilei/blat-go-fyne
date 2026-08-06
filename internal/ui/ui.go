@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 // Console is a blocking, line-based UI used as the default reference
@@ -18,6 +19,10 @@ type Console struct {
 	r   *bufio.Reader
 	w   io.Writer
 	log io.Writer
+
+	mu   sync.Mutex
+	buf  []string // 日志环形缓冲，供上报逻辑（hook_stop）取完整日志
+	cap  int
 }
 
 // NewConsole returns a Console that reads from stdin and writes prompts to
@@ -28,6 +33,7 @@ func NewConsole() *Console {
 		r:   bufio.NewReader(os.Stdin),
 		w:   os.Stdout,
 		log: os.Stdout,
+		cap: 1000,
 	}
 }
 
@@ -38,12 +44,32 @@ func NewConsoleWith(in io.Reader, promptOut, logOut io.Writer) *Console {
 		r:   bufio.NewReader(in),
 		w:   promptOut,
 		log: logOut,
+		cap: 1000,
 	}
 }
 
-func (c *Console) Info(s string)  { fmt.Fprintln(c.log, "[INFO]", s) }
-func (c *Console) Warn(s string)  { fmt.Fprintln(c.log, "[WARN]", s) }
-func (c *Console) Error(s string) { fmt.Fprintln(c.log, "[ERROR]", s) }
+func (c *Console) Info(s string)  { c.logLine("[INFO]", s) }
+func (c *Console) Warn(s string)  { c.logLine("[WARN]", s) }
+func (c *Console) Error(s string) { c.logLine("[ERROR]", s) }
+
+func (c *Console) logLine(prefix, s string) {
+	line := prefix + " " + s
+	fmt.Fprintln(c.log, line)
+	c.mu.Lock()
+	c.buf = append(c.buf, line)
+	if len(c.buf) > c.cap {
+		c.buf = c.buf[len(c.buf)-c.cap:]
+	}
+	c.mu.Unlock()
+}
+
+// SnapshotLog 返回已缓冲的日志行（按时间顺序，每行以换行结尾）。
+// 供上报逻辑（hook_stop 上传 OSS/存库）在计划结束后取完整日志使用。
+func (c *Console) SnapshotLog() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.buf, "\n") + "\n"
+}
 
 // Prompt blocks until the user enters a line or ctx is cancelled.
 func (c *Console) Prompt(ctx context.Context, label, def string) (string, error) {

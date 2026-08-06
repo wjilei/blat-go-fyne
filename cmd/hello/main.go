@@ -38,14 +38,16 @@ import (
 	"blat/internal/runtime"
 	"blat/internal/ui"
 	fyneui "blat/internal/ui/fyne"
+	"blat/internal/uploader"
 )
 
 // builtinPlans 是测试计划下拉框的内置选项。每项对应一个 plan.yml 文件，
 // 显示名按产线实际计划自定义；新增计划只需在此追加一项。
 var builtinPlans = []fyneui.PlanItem{
-	{Name: "默认计划", Path: "confs/plan.yml"},
-	{Name: "Heat 蓝牙示例", Path: "examples/heat/plan.yml"},
-	{Name: "Hello 问候示例", Path: "examples/hello/plan.yml"},
+	{Name: "平衡阀初始化电机", Path: "confs/plan_PSAV_ut_resetvalve.yml"},
+	{Name: "平衡阀检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
+	{Name: "流量计检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
+	{Name: "户控阀检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
 }
 
 // planInList 报告 path 是否已存在于 items（按规范化路径比较）。
@@ -64,6 +66,7 @@ func main() {
 	envPath := flag.String("env", "confs/env.yml", "path to vars YAML (e.g. MBUS port); 缺文件忽略")
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
 	mockBT := flag.Bool("mock-bt", true, "use mock bluetooth (no hardware); set false for real BLE")
+	debug := flag.Bool("debug", false, "debug 模式：不实际上传 OSS / 保存数据库，把要上报的数据打印到日志")
 	flag.Parse()
 
 	// 组装下拉框计划列表：内置列表 + （若 --plan 指定了列表外的文件）额外项。
@@ -125,12 +128,12 @@ func main() {
 			fmt.Fprintln(os.Stderr, "-no-gui 模式必须用 --plan 指定计划文件")
 			os.Exit(2)
 		}
-		os.Exit(runConsole(plan, vars))
+		os.Exit(runConsole(plan, vars, *debug))
 	}
-	os.Exit(runGUI(items, selectPath, vars))
+	os.Exit(runGUI(items, selectPath, vars, *debug))
 }
 
-func runConsole(plan *config.Plan, vars map[string]any) int {
+func runConsole(plan *config.Plan, vars map[string]any, debug bool) int {
 	c := ui.NewConsole()
 	env := &core.Env{
 		Ctx:  context.Background(),
@@ -142,7 +145,14 @@ func runConsole(plan *config.Plan, vars map[string]any) int {
 	}
 	reg := cases.Global()
 	pr := runtime.NewPlanRunner(reg)
-	rep := report.NewMulti(report.NewYAMLFile("."), report.NewTAP(nil))
+	rep := report.NewMulti(
+		report.NewYAMLFile("."),
+		report.NewTAP(nil),
+		// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
+		// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。
+		// 日志取 Console 环形缓冲的完整快照；--debug 时不触网，仅打印上报数据。
+		uploader.NewHookStop(env, c.SnapshotLog, debug),
+	)
 	if err := pr.RunPlan(context.Background(), plan, env, rep); err != nil {
 		fmt.Fprintln(os.Stderr, "FAIL:", err)
 		return 1
@@ -150,7 +160,7 @@ func runConsole(plan *config.Plan, vars map[string]any) int {
 	return 0
 }
 
-func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any) int {
+func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, debug bool) int {
 	gui := fyneui.New("blat-go hello")
 
 	env := &core.Env{
@@ -166,6 +176,8 @@ func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any) int
 	// plan 的生命周期由下拉框接管：Attach 时 plan 传 nil，下拉框选中/清空
 	// 时由 GUI 内部加载计划、重建用例树并写入 env.Vars["HeatNote"]["plan"]。
 	gui.Attach(nil, env, reg)
+	// --debug：跳过日志上传 OSS，日志以原始文本随测试记录存库。
+	gui.SetDebug(debug)
 	gui.SetPlanList(items, selectPath)
 
 	// Block on the Fyne event loop. Closing the window cancels any
