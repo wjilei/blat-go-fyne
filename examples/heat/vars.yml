@@ -1,6 +1,8 @@
 # 通过蓝牙测试的环境变量（demo stub，不接真实硬件）
 HeatNote:
-  mac: "test-mac"
-  pipe: 20
-  软件版本: 0
-  test_mode: "single"
+  mbus:
+    port: "com1"
+    baudRate: 2400
+    parity: "even"
+
+

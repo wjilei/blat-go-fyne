@@ -66,6 +66,46 @@ func TestYAMLReporter_FileMode(t *testing.T) {
 	}
 }
 
+// TestYAMLReporter_PathMode verifies the fixed-path mode truncates any
+// previous file at OnPlanStart so each run starts with a clean slate.
+func TestYAMLReporter_PathMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.yml")
+
+	// 第一次 run：写入一份完整报告。
+	r1 := NewYAMLPath(path)
+	r1.OnPlanStart(1, time.Now())
+	r1.OnCaseStop(1, CaseReport{Seq: 1, Name: "A::B", Result: CaseOK})
+	r1.OnPlanStop(Summary{TotalNum: 1, OKNum: 1, Result: "pass"})
+
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after first run: %v", err)
+	}
+	if !strings.Contains(string(first), "case_seq: 1") {
+		t.Fatalf("first run missing case entry:\n%s", first)
+	}
+
+	// 第二次 run：覆盖写到同一路径，case 数量也不同，验证旧内容被截断。
+	r2 := NewYAMLPath(path)
+	r2.OnPlanStart(2, time.Now())
+	r2.OnCaseStop(1, CaseReport{Seq: 1, Name: "X::Y", Result: CaseOK})
+	r2.OnCaseStop(2, CaseReport{Seq: 2, Name: "X::Z", Result: CaseOK})
+	r2.OnPlanStop(Summary{TotalNum: 2, OKNum: 2, Result: "pass"})
+
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after second run: %v", err)
+	}
+	s := string(second)
+	if strings.Contains(s, "A::B") {
+		t.Errorf("second run should not contain first run's case name; got:\n%s", s)
+	}
+	if !strings.Contains(s, "X::Y") || !strings.Contains(s, "X::Z") {
+		t.Errorf("second run missing new case entries:\n%s", s)
+	}
+}
+
 func TestTAPReporter(t *testing.T) {
 	var buf bytes.Buffer
 	r := NewTAP(&buf)

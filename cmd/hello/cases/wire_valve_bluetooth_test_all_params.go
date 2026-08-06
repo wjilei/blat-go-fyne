@@ -42,19 +42,34 @@ func (c *WireValveBluetoothTestAllParamsCase) Configure(args map[string]any) err
 }
 
 func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core.Env) error {
-	bt, ok := env.Devs["bluetooth"].(*bluetooth.Device)
+	// 优先复用已持久化的蓝牙连接（存于 Vars.HeatNote["bluetooth"]，mock 或
+	// real 由 bt_mock 标志决定构造）；无则创建并连接后存回，供后续 case 复用。
+	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
+	bt, ok := heatnote["bluetooth"].(*bluetooth.Device)
 	if !ok {
-		return errors.New("bluetooth device not configured")
-	}
-	heatnote, ok := env.Vars["HeatNote"].(map[string]any)
-	if !ok {
-		return errors.New("HeatNote vars not configured")
+		// 注意：不能无条件 fallback 到 env.Devs["bluetooth"]——main 始终注入
+		// NewDevice()（mock），无条件复用会让 -mock-bt=false 拿不到 real 实例。
+		// 仅当 Devs 实例的模式与 bt_mock 请求的模式一致时才兜底复用。
+		mock, _ := heatnote["bt_mock"].(bool)
+		if dev, has := env.Devs["bluetooth"].(*bluetooth.Device); has && !dev.IsReal() == mock {
+			bt = dev
+		} else if mock {
+			bt = bluetooth.NewMockDevice()
+		} else {
+			bt = bluetooth.NewRealDevice()
+		}
+		// 存回 vars 供后续 case 复用
+		if heatnote == nil {
+			heatnote = map[string]any{}
+			env.Vars["HeatNote"] = heatnote
+		}
+		heatnote["bluetooth"] = bt
 	}
 
 	id := _str(heatnote, "mac")
 	pipe := _int(heatnote, "pipe")
 	testMode := _str(heatnote, "test_mode")
-	// 软件版本：优先 HeatNote（demo vars.yml 的位置），兜底 env.Vars 顶层
+	// 软件版本：优先 HeatNote（demo confs/env.yml 的位置），兜底 env.Vars 顶层
 	// （Perl 里是 env_args["软件版本"]）。
 	softVer := _int(heatnote, "软件版本")
 	if softVer == 0 {

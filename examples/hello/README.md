@@ -13,9 +13,12 @@
 ```powershell
 cd tools\win32\blat-go
 $env:GOWORK = "off"
-go build -o .\bin\hello.exe .\cmd\hello
+go build -ldflags="-w" -o .\bin\hello.exe .\cmd\hello
 .\bin\hello.exe -plan .\examples\hello\plan.yml
 ```
+
+> `-ldflags="-w"` 去掉 DWARF 调试信息。Go 1.25 在 Windows / Win11 24H2
+> 上带 DWARF 的 PE 可能无法加载，必须去掉。
 
 无 GUI 环境（CI / 容器）：
 

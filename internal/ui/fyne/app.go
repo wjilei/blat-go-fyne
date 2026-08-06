@@ -49,6 +49,7 @@ import (
 	"blat/internal/core"
 	"blat/internal/report"
 	"blat/internal/runtime"
+	"blat/internal/serial"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -111,6 +112,12 @@ type App struct {
 	status    *widget.Label
 	prog      *widget.ProgressBar
 	startBtn  *widget.Button
+	configBtn *widget.Button
+
+	// varsFile 是配置（MBUS 串口等）持久化的目标文件路径；相对工作目录。
+	// 启动时 main 用 config.LoadEnv(varsFile) 读入 env.Vars，配置弹框
+	// 写回同一文件，保证"下次启动自动加载"。
+	varsFile string
 
 	mu         sync.Mutex
 	tapPartial bytes.Buffer // 暂存未完成（无换行结尾）的 TAP 半行
@@ -118,6 +125,7 @@ type App struct {
 	logBuf     []logEntry
 	logCap     int
 	cat        string
+	serNum     string // 启动弹框输入的序列号，受 mu 保护
 
 	promptCh  chan promptReq
 	confirmCh chan confirmReq
@@ -149,6 +157,7 @@ func New(title string) *App {
 		fa:        fa,
 		win:       win,
 		logCap:    defaultLogCap,
+		varsFile:  "confs/env.yml",
 		promptCh:  make(chan promptReq, 8),
 		confirmCh: make(chan confirmReq, 8),
 		shutdown:  make(chan struct{}),
@@ -228,6 +237,28 @@ func newTopBorder(content fyne.CanvasObject, lineColor fyne.ThemeColorName, line
 	line := canvas.NewLine(themeColor(lineColor))
 	line.StrokeWidth = lineWidth
 	return container.New(layout.NewBorderLayout(line, nil, nil, nil), content, line)
+}
+
+// minSizeLayout 让容器 MinSize 至少为给定值，子对象铺满容器。
+// 用 container.New(minSizeLayout, obj) 包装，而不是包装对象本身：
+// Fyne v2.8 的 *fyne.Container 只实现 CanvasObject（不实现 fyne.Widget），
+// 若在 SetContent 外包一层非 Container 对象会破坏 Fyne 对 Container 的
+// 专用渲染路径 → 整窗空白。自定义 layout 的 Container 仍走正常渲染。
+// 用途：规避 Fyne v2.8 glfw 在 Windows 上最小化恢复时把窗口 clamp 到
+// content MinSize（极小值）的缺陷——固定合理下限让恢复路径回到初始尺寸。
+type minSizeLayout struct {
+	min fyne.Size
+}
+
+func (l minSizeLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	return l.min
+}
+
+func (l minSizeLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		o.Resize(size)
+		o.Move(fyne.NewPos(0, 0))
+	}
 }
 
 func (a *App) build() {
@@ -314,23 +345,29 @@ func (a *App) build() {
 	a.startBtn = widget.NewButtonWithIcon("开始测试", theme.MediaPlayIcon(), func() {
 		switch a.startBtn.Text {
 		case "开始测试":
-			a.startRun()
+			a.promptSerialThenRun()
 		case "结束测试":
 			a.StopRun()
 		}
 	})
 
-	tb := newBottomBorder(container.NewHBox(a.startBtn), theme.ColorNameInputBorder, 1)
+	a.configBtn = widget.NewButtonWithIcon("配置", theme.SettingsIcon(), func() {
+		a.promptConfig()
+	})
+
+	tb := newBottomBorder(container.NewHBox(a.startBtn, a.configBtn), theme.ColorNameInputBorder, 1)
 
 	statusBar := newTopBorder(container.NewHBox(a.status, layout.NewSpacer(), a.prog), theme.ColorNameInputBorder, 1)
 
 	// 程序主场口，左右两栏，左窄右宽
 	mainFrame := container.NewHSplit(a.tree, a.logScroll)
 	mainFrame.SetOffset(0.3)
-	a.win.SetContent(container.NewBorder(
-		tb, statusBar, nil, nil,
-		mainFrame,
-	))
+	// 包一层 MinSize 下限：Fyne v2.8 glfw 在 Windows 上最小化恢复时
+	// 会把窗口 clamp 到 content 的 MinSize（极小），导致窗口变小。
+	// 用自定义 layout 的 Container 保证 center 区域 MinSize ≥ 960x640，
+	// 恢复路径会回到初始尺寸。
+	center := container.New(minSizeLayout{min: fyne.NewSize(960, 640)}, mainFrame)
+	a.win.SetContent(container.NewBorder(tb, statusBar, nil, nil, center))
 	// Fyne Tree 的根节点（t.Root=""）不可见，且 IsBranchOpen 默认 false：
 	// 若不显式展开根，walk() 不会下钻到 childUIDs("") 返回的子节点。
 	// 在此一次性把根与 plan/config 分支全部 open，使默认状态可见、可点击。
@@ -487,6 +524,141 @@ func (a *App) loadPlan() {
 	fd.Show()
 }
 
+// promptConfig 弹出配置表单：当前只有一项——MBUS 串口下拉框。
+//
+// 数据流：
+//  1. 列串口（serial.ListPorts）。列表为空时弹一个"无可用串口"的提示对话框。
+//  2. 从 env.Vars["mbus"] 读已保存的端口作为 Select 初值。
+//  3. dialog.NewForm 提交时把新端口写回 env.Vars["mbus"]["port"]，
+//     再用 config.SaveEnv 覆盖 confs/env.yml。
+//
+// 失败一律弹 dialog.ShowError，不静默吞。
+func (a *App) promptConfig() {
+	ports, err := serial.ListPorts()
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("枚举串口失败: %w", err), a.win)
+		return
+	}
+	if len(ports) == 0 {
+		dialog.ShowInformation("配置", "未发现可用串口", a.win)
+		return
+	}
+
+	// 当前选中的串口：env.Vars["mbus"]["port"]。env 可能尚未 Attach，
+	// 这种情况下 mbusPort 留空，由用户从下拉里挑。
+	current := ""
+	a.mu.Lock()
+	if a.env != nil {
+		if m, ok := a.env.Vars["mbus"].(map[string]any); ok {
+			if p, ok := m["port"].(string); ok {
+				current = p
+			}
+		}
+	}
+	a.mu.Unlock()
+
+	// 当前值若不在枚举结果里（设备被拔了），把它插到下拉首位以便显示。
+	if current != "" {
+		found := false
+		for _, p := range ports {
+			if p == current {
+				found = true
+				break
+			}
+		}
+		if !found {
+			ports = append([]string{current}, ports...)
+		}
+	}
+
+	sel := widget.NewSelect(ports, nil)
+	sel.SetSelected(current)
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("MBUS 串口", sel),
+	}
+	dialog.NewForm("配置", "保存", "取消", items, func(ok bool) {
+		if !ok {
+			return
+		}
+		picked := sel.Selected
+		if picked == "" {
+			a.Warn("未选择串口")
+			return
+		}
+		a.applyMBUSPort(picked)
+	}, a.win).Show()
+}
+
+// applyMBUSPort 把新串口写进 env.Vars 并落盘到 confs/env.yml。env 为 nil
+// （未 Attach）时直接返回——这种情况在产品流程里不会出现，防御性兜底。
+func (a *App) applyMBUSPort(port string) {
+	a.mu.Lock()
+	if a.env == nil {
+		a.mu.Unlock()
+		a.Warn("env 尚未初始化，无法保存配置")
+		return
+	}
+	mbus, _ := a.env.Vars["mbus"].(map[string]any)
+	if mbus == nil {
+		mbus = map[string]any{}
+	}
+	mbus["port"] = port
+	a.env.Vars["mbus"] = mbus
+	path := a.varsFile
+	a.mu.Unlock()
+
+	// 落盘前剔除不可序列化的运行时对象（如 Vars.HeatNote["bluetooth"] 里的
+	// *bluetooth.Device），否则 yaml.Marshal 会失败。
+	if err := config.SaveEnv(path, config.CleanVars(a.env.Vars, "bluetooth")); err != nil {
+		dialog.ShowError(fmt.Errorf("保存 %s 失败: %w", path, err), a.win)
+		return
+	}
+	a.Info("MBUS 串口已保存: " + port)
+}
+
+// promptSerialThenRun 弹出一个输入框让用户填序列号，回车或点"确定"都会
+// 触发 startRun；取消或空值不启动。序列号存到 a.serNum 备用。
+func (a *App) promptSerialThenRun() {
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder("请输入序列号")
+
+	var dlg dialog.Dialog
+	confirm := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			a.Warn("序列号不能为空")
+			return
+		}
+		if dlg != nil {
+			dlg.Hide()
+		}
+		a.mu.Lock()
+		a.serNum = text
+		a.mu.Unlock()
+		a.Info("序列号: " + text)
+		a.startRun()
+	}
+	// 回车键：直接走 confirm
+	entry.OnSubmitted = func(s string) { confirm(s) }
+
+	dlg = dialog.NewCustomConfirm(
+		"开始测试", "确定", "取消", entry,
+		func(ok bool) {
+			if ok {
+				confirm(entry.Text)
+			}
+		},
+		a.win,
+	)
+	dlg.Show()
+	// Fyne 的 CustomConfirm 不会自动 focus 内部 Entry；规则见项目 AGENTS.md。
+	// 用 fyne.Do 把 Focus 排到主线程下一帧——届时 dialog 已 mount 完。
+	fyne.Do(func() {
+		a.win.Canvas().Focus(entry)
+	})
+}
+
 // startRun executes the attached plan with the registered cases in a fresh
 // goroutine. It is invoked by the toolbar Start button; pressing it again
 // while a run is active cancels the old run via StartRun and restarts.
@@ -510,8 +682,8 @@ func (a *App) startRun() {
 		pr := runtime.NewPlanRunner(reg)
 		adp := &guiAdapter{gui: a} // 留出引用以便退出前标记取消态
 		rep := report.NewMulti(
-			report.NewYAMLFile("."),
-			report.NewTAP(&tapWriter{a: a}), // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
+			report.NewYAMLPath("report.yml"), // 固定文件名 + 每次开始时清空
+			report.NewTAP(&tapWriter{a: a}),  // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
 			adp,
 		)
 		err := pr.RunPlan(ctx, plan, env, rep)

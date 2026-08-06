@@ -22,11 +22,13 @@ import (
 //	    test_total_num: 1
 //	    test_result: pass
 //
-// Output goes to an io.Writer (default os.Stdout) or, in file mode, to a
-// report_<timestamp>.yml opened on OnPlanStart.
+// Output goes to an io.Writer (default os.Stdout), or, in file mode, to a
+// fixed path (NewYAMLPath) or to a timestamped report_<ts>.yml in a directory
+// (NewYAMLFile), opened on OnPlanStart.
 type YAMLReporter struct {
 	w     io.Writer
-	dir   string // non-empty => file mode
+	dir   string // non-empty => file mode, timestamped per run
+	path  string // non-empty => file mode, fixed path, truncated on each run
 	f     *os.File
 	cases []CaseReport
 }
@@ -46,20 +48,38 @@ func NewYAMLFile(dir string) *YAMLReporter {
 	return &YAMLReporter{dir: dir}
 }
 
+// NewYAMLPath returns a reporter that writes to a fixed file path,
+// truncating any existing file at OnPlanStart. Use this when callers want a
+// stable filename across runs (e.g. the GUI's single rolling report) instead
+// of one timestamped file per run.
+func NewYAMLPath(path string) *YAMLReporter {
+	return &YAMLReporter{path: path}
+}
+
 func (y *YAMLReporter) OnPlanStart(total int, startTime time.Time) {
 	y.cases = y.cases[:0]
-	if y.dir == "" {
-		return
+	switch {
+	case y.path != "":
+		// 固定路径：os.Create 行为等价 truncate+create —— 每次开始测试
+		// 都会把上一次运行留下的日志清空。
+		f, err := os.Create(y.path)
+		if err != nil {
+			y.w = os.Stdout
+			return
+		}
+		y.f = f
+		y.w = f
+	case y.dir != "":
+		name := filepath.Join(y.dir, fmt.Sprintf("report_%s.yml", startTime.Format("20060102_150405")))
+		f, err := os.Create(name)
+		if err != nil {
+			// Fall back to stdout rather than silently losing the report.
+			y.w = os.Stdout
+			return
+		}
+		y.f = f
+		y.w = f
 	}
-	name := filepath.Join(y.dir, fmt.Sprintf("report_%s.yml", startTime.Format("20060102_150405")))
-	f, err := os.Create(name)
-	if err != nil {
-		// Fall back to stdout rather than silently losing the report.
-		y.w = os.Stdout
-		return
-	}
-	y.f = f
-	y.w = f
 }
 
 func (y *YAMLReporter) OnCaseStart(seq int, cr CaseReport) {}

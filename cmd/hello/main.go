@@ -3,8 +3,7 @@
 // It opens a Fyne window, loads plan.yml, and runs the plan (all cases
 // auto-registered by the cases package). Pass -no-gui to run with the
 // console UI instead (useful in CI / headless boxes). Pass --env to load
-// a YAML env file into Env.Vars (e.g. examples/heat/vars.yml for the
-// Heat demo).
+// a YAML env file into Env.Vars (e.g. confs/env.yml for the Heat demo).
 //
 // Startup order for the GUI mode:
 //  1. Build fyne UI (creates widgets, starts pump goroutine).
@@ -36,9 +35,10 @@ import (
 )
 
 func main() {
-	planPath := flag.String("plan", "examples/hello/plan.yml", "path to plan YAML")
-	envPath := flag.String("env", "", "path to env YAML (optional)")
+	planPath := flag.String("plan", "confs/plan.yml", "path to plan YAML")
+	envPath := flag.String("env", "confs/env.yml", "path to vars YAML (e.g. MBUS port); 缺文件忽略")
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
+	mockBT := flag.Bool("mock-bt", true, "use mock bluetooth (no hardware); set false for real BLE")
 	flag.Parse()
 
 	plan, err := config.LoadPlan(*planPath)
@@ -53,13 +53,28 @@ func main() {
 
 	vars := map[string]any{}
 	if *envPath != "" {
-		v, err := config.LoadEnv(*envPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "load env:", err)
+		// 文件不存在视为"未配置"，vars 留空；其它错误才退出。
+		if _, statErr := os.Stat(*envPath); statErr == nil {
+			v, err := config.LoadEnv(*envPath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "load env:", err)
+				os.Exit(2)
+			}
+			vars = v
+		} else if !os.IsNotExist(statErr) {
+			fmt.Fprintln(os.Stderr, "stat env:", statErr)
 			os.Exit(2)
 		}
-		vars = v
 	}
+
+	// 注入蓝牙 mock 开关（两分支共用）：case 端据此选择构造 mock 还是 real
+	// 设备。HeatNote 键是大写且必须存在，bt_mock 存 bool。
+	heatnote, _ := vars["HeatNote"].(map[string]any)
+	if heatnote == nil {
+		heatnote = map[string]any{}
+		vars["HeatNote"] = heatnote
+	}
+	heatnote["bt_mock"] = *mockBT
 
 	if *noGUI {
 		os.Exit(runConsole(plan, vars))
