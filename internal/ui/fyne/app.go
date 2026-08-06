@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"image/color"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -269,6 +270,28 @@ func (l minSizeLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	for _, o := range objs {
 		o.Resize(size)
 		o.Move(fyne.NewPos(0, 0))
+	}
+}
+
+// minWidthLayout 把单一子对象的 MinSize 宽度撑到至少 w 像素，高度保持
+// 原样。用于把 Entry 等默认较窄的控件放进 PopUp / dialog 时撑出合理宽度，
+// 同时让高度由 VBox 自然计算（不像 minSizeLayout 会锁死高度）。
+type minWidthLayout struct{ w float32 }
+
+func (l minWidthLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	if len(objs) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	m := objs[0].MinSize()
+	if m.Width < l.w {
+		m.Width = l.w
+	}
+	return m
+}
+
+func (l minWidthLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, c := range objs {
+		c.Resize(size)
 	}
 }
 
@@ -764,43 +787,81 @@ func (a *App) applyMBUSPort(port string) {
 	a.Info("MBUS 串口已保存: " + port)
 }
 
+// serialFormatRe 序列号格式：可选 W 开头（不区分大小写）后接 12 位数字。
+// 对应 Perl 侧 BLAT 主程序的 $tmp_sn =~ /^W?\d{12}/i。
+var serialFormatRe = regexp.MustCompile(`^W?\d{12}`)
+
 // promptSerialThenRun 弹出一个输入框让用户填序列号，回车或点"确定"都会
-// 触发 startRun；取消或空值不启动。序列号存到 a.serNum 备用。
+// 触发格式校验，校验通过后启动 startRun；取消或校验失败则保持弹框直到
+// 用户改对。序列号存到 a.serNum 备用。
+//
+// 不用 dialog.NewCustom / NewCustomConfirm：前者即便 dismissText 为空也
+// 会渲染一个空按钮占位栏（"第三个空按钮"的来源），后者在点"确定"后必
+// 然自动 dismiss 无法阻止弹框关闭。改用 widget.NewPopUp 自管全部布局。
 func (a *App) promptSerialThenRun() {
 	entry := widget.NewEntry()
-	entry.SetPlaceHolder("请输入序列号")
+	entry.SetPlaceHolder("请输入序列号（12 位数字，可选 W 开头）")
+	// Entry 默认 MinSize 较窄，撑出 360 像素让弹窗整体更合理（避免
+	// 按钮被挤到换行）。
+	entryWrap := container.New(minWidthLayout{w: 360}, entry)
 
-	var dlg dialog.Dialog
-	confirm := func(text string) {
-		text = strings.TrimSpace(text)
-		if text == "" {
-			a.Warn("序列号不能为空")
+	errLabel := widget.NewLabel("")
+	// DangerImportance 让错误提示以主题错误色（红色）渲染。
+	errLabel.Importance = widget.DangerImportance
+	errLabel.Hide()
+
+	var popup *widget.PopUp
+	tryConfirm := func() {
+		text := strings.TrimSpace(entry.Text)
+		switch {
+		case text == "":
+			errLabel.SetText("序列号不能为空")
+		case !serialFormatRe.MatchString(text):
+			errLabel.SetText("序列号格式不对，应为可选 W 开头后接 12 位数字")
+		default:
+			if popup != nil {
+				popup.Hide()
+			}
+			a.mu.Lock()
+			a.serNum = text
+			a.mu.Unlock()
+			a.startRun()
 			return
 		}
-		if dlg != nil {
-			dlg.Hide()
-		}
-		a.mu.Lock()
-		a.serNum = text
-		a.mu.Unlock()
-		a.Info("序列号: " + text)
-		a.startRun()
+		// 校验失败：popup 保持显示，重新聚焦 entry 便于重输。
+		errLabel.Show()
+		fyne.Do(func() {
+			a.win.Canvas().Focus(entry)
+		})
 	}
-	// 回车键：直接走 confirm
-	entry.OnSubmitted = func(s string) { confirm(s) }
+	// 回车键：直接走 tryConfirm
+	entry.OnSubmitted = func(string) { tryConfirm() }
 
-	dlg = dialog.NewCustomConfirm(
-		"开始测试", "确定", "取消", entry,
-		func(ok bool) {
-			if ok {
-				confirm(entry.Text)
-			}
-		},
-		a.win,
+	okBtn := widget.NewButton("确定", tryConfirm)
+	cancelBtn := widget.NewButton("取消", func() {
+		if popup != nil {
+			popup.Hide()
+		}
+	})
+	// 取消靠左、确定靠右
+	buttonRow := container.NewHBox(layout.NewSpacer(), cancelBtn, okBtn)
+
+	title := widget.NewLabelWithStyle("输入设备序列号", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	content := container.NewVBox(
+		title,
+		widget.NewSeparator(),
+		entryWrap,
+		errLabel,
+		buttonRow,
 	)
-	dlg.Show()
-	// Fyne 的 CustomConfirm 不会自动 focus 内部 Entry；规则见项目 AGENTS.md。
-	// 用 fyne.Do 把 Focus 排到主线程下一帧——届时 dialog 已 mount 完。
+	// 四周 padding 模拟 Fyne dialog 默认风格
+	padded := container.New(layout.NewPaddedLayout(), content)
+
+	popup = widget.NewPopUp(padded, a.win.Canvas())
+	popup.Show()
+	// Fyne 的 PopUp 不会自动 focus 内部 Entry；规则见项目 AGENTS.md。
+	// 用 fyne.Do 把 Focus 排到主线程下一帧——届时 popup 已 mount 完。
 	fyne.Do(func() {
 		a.win.Canvas().Focus(entry)
 	})
