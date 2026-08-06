@@ -528,8 +528,8 @@ func (a *App) loadPlan() {
 //
 // 数据流：
 //  1. 列串口（serial.ListPorts）。列表为空时弹一个"无可用串口"的提示对话框。
-//  2. 从 env.Vars["mbus"] 读已保存的端口作为 Select 初值。
-//  3. dialog.NewForm 提交时把新端口写回 env.Vars["mbus"]["port"]，
+//  2. 从 env.Vars["HeatNote"]["mbus"] 读已保存的端口作为 Select 初值。
+//  3. dialog.NewForm 提交时把新端口写回 env.Vars["HeatNote"]["mbus"]["port"]，
 //     再用 config.SaveEnv 覆盖 confs/env.yml。
 //
 // 失败一律弹 dialog.ShowError，不静默吞。
@@ -544,14 +544,16 @@ func (a *App) promptConfig() {
 		return
 	}
 
-	// 当前选中的串口：env.Vars["mbus"]["port"]。env 可能尚未 Attach，
-	// 这种情况下 mbusPort 留空，由用户从下拉里挑。
+	// 当前选中的串口：env.Vars["HeatNote"]["mbus"]["port"]。env 可能尚未
+	// Attach，这种情况下 mbusPort 留空，由用户从下拉里挑。
 	current := ""
 	a.mu.Lock()
 	if a.env != nil {
-		if m, ok := a.env.Vars["mbus"].(map[string]any); ok {
-			if p, ok := m["port"].(string); ok {
-				current = p
+		if hn, ok := a.env.Vars["HeatNote"].(map[string]any); ok {
+			if m, ok := hn["mbus"].(map[string]any); ok {
+				if p, ok := m["port"].(string); ok {
+					current = p
+				}
 			}
 		}
 	}
@@ -599,12 +601,17 @@ func (a *App) applyMBUSPort(port string) {
 		a.Warn("env 尚未初始化，无法保存配置")
 		return
 	}
-	mbus, _ := a.env.Vars["mbus"].(map[string]any)
+	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		hn = map[string]any{}
+	}
+	mbus, _ := hn["mbus"].(map[string]any)
 	if mbus == nil {
 		mbus = map[string]any{}
 	}
 	mbus["port"] = port
-	a.env.Vars["mbus"] = mbus
+	hn["mbus"] = mbus
+	a.env.Vars["HeatNote"] = hn
 	path := a.varsFile
 	a.mu.Unlock()
 
