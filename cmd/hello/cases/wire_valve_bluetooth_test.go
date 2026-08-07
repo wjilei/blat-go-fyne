@@ -43,53 +43,19 @@ func (c *WireValveBluetoothTestAllParamsCase) Configure(args map[string]any) err
 }
 
 func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core.Env) error {
-	// 优先复用已持久化的蓝牙连接（存于 Vars.HeatNote["bluetooth"]，mock 或
-	// real 由 bt_mock 标志决定构造）；无则创建并连接后存回，供后续 case 复用。
-	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
-	bt, ok := heatnote["bluetooth"].(*bluetooth.Device)
-	if !ok {
-		// 注意：不能无条件 fallback 到 env.Devs["bluetooth"]——main 默认注入
-		// NewDevice()（real），无条件复用会让 -mock-bt=true 拿不到 mock 实例。
-		// 仅当 Devs 实例的模式与 bt_mock 请求的模式一致时才兜底复用。
-		mock, _ := heatnote["bt_mock"].(bool)
-		if dev, has := env.Devs["bluetooth"].(*bluetooth.Device); has && !dev.IsReal() == mock {
-			bt = dev
-		} else if mock {
-			bt = bluetooth.NewMockDevice()
-		} else {
-			bt = bluetooth.NewRealDevice()
-		}
-		// 存回 vars 供后续 case 复用
-		if heatnote == nil {
-			heatnote = map[string]any{}
-			env.Vars["HeatNote"] = heatnote
-		}
-		heatnote["bluetooth"] = bt
+	// 连接蓝牙（复用/创建并持久化连接，见 _ensureBluetooth）
+	bt, id, err := _ensureBluetooth(ctx, env, c.deviceType)
+	if err != nil {
+		return err
 	}
 
-	id := _str(heatnote, "serial")
+	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
 	pipe := _int(heatnote, "pipe")
 	// 软件版本：优先 HeatNote（demo confs/env.yml 的位置），兜底 env.Vars 顶层
 	// （Perl 里是 env_args["软件版本"]）。
 	softVer := _int(heatnote, "软件版本")
 	if softVer == 0 {
 		softVer = _int(env.Vars, "软件版本")
-	}
-
-	// 连接（参照 Perl bluetooth_test_all_params / _ensure_bluetooth_connected）：
-	// mac 由序列号 parseIdToMac 派生；已连接则跳过重复连接，否则重试连接
-	// （Device.Connect 内部最多重试 2 次，对应 Perl ConnectBle 重试）。
-	// 设备类型决定蓝牙协议帧头字节（PSAV→f9，其它→f8），对应 Perl dev_type 字段
-	bt.SetDevType(c.deviceType)
-	// 注入日志输出：发现服务/特征成功、扫描成功、连接成功都会打日志
-	bt.SetLogger(env.Log)
-
-	env.Log.Info("扫描并连接蓝牙")
-	mac := bluetooth.ParseIdToMac(id)
-	if bt.IsConnected(mac) {
-		env.Log.Info("蓝牙已连接，跳过重复连接")
-	} else if err := bt.Connect(ctx, id); err != nil {
-		return fmt.Errorf("%w", err)
 	}
 
 	// 重启
@@ -193,4 +159,91 @@ func init() {
 	Register("HeatSuite::wire_valve_bluetooth_test_all_params", func() (core.Case, error) {
 		return &WireValveBluetoothTestAllParamsCase{}, nil
 	})
+	Register("HeatSuite::wire_valve_bluetooth_reset_valve", func() (core.Case, error) {
+		return &WireValveBluetoothResetValveCase{}, nil
+	})
+}
+
+// WireValveBluetoothResetValveCase 翻译自 Perl
+// BLAT::APP::Heat::Cases::wire_valve::bluetooth_reset_valve。
+// 流程：连接蓝牙 → 重置阀门（ResetValve）。
+type WireValveBluetoothResetValveCase struct {
+	deviceType string // 设备类型：PFW / PSAV
+}
+
+func (c *WireValveBluetoothResetValveCase) Name() string {
+	return "wire_valve_bluetooth_reset_valve"
+}
+
+// Configure 读取 plan 的自定义参数，默认设备类型=PSAV（与 test_all_params 一致）。
+func (c *WireValveBluetoothResetValveCase) Configure(args map[string]any) error {
+	if v, ok := args["设备类型"].(string); ok && v != "" {
+		c.deviceType = v
+	}
+	if c.deviceType == "" {
+		c.deviceType = "PSAV"
+	}
+	return nil
+}
+
+func (c *WireValveBluetoothResetValveCase) Run(ctx context.Context, env *core.Env) error {
+	// 连接蓝牙（复用/创建并持久化连接，见 _ensureBluetooth）
+	bt, _, err := _ensureBluetooth(ctx, env, c.deviceType)
+	if err != nil {
+		return err
+	}
+
+	// 重置阀门
+	env.Log.Info("重置阀门")
+	if err := bt.ResetValve(ctx); err != nil {
+		return fmt.Errorf("重置阀门失败: %w", err)
+	}
+	env.Log.Info("重置阀门成功")
+	return nil
+}
+
+// _ensureBluetooth 获取/创建蓝牙设备并确保已连接（对应 Perl
+// _ensure_bluetooth_connected）。优先复用 Vars.HeatNote["bluetooth"] 已持久化的
+// 连接（mock 或 real 由 bt_mock 标志决定构造）；无则创建、连接后写回 HeatNote 供
+// 后续 case 复用。设备类型决定蓝牙协议帧头字节（PSAV→f9，其它→f8），对应 Perl
+// dev_type 字段。返回设备与序列号（由 HeatNote["serial"] 派生 mac 用于连接）。
+func _ensureBluetooth(ctx context.Context, env *core.Env, deviceType string) (*bluetooth.Device, string, error) {
+	// 注意：不能无条件 fallback 到 env.Devs["bluetooth"]——main 默认注入
+	// NewDevice()（real），无条件复用会让 -mock-bt=true 拿不到 mock 实例。
+	// 仅当 Devs 实例的模式与 bt_mock 请求的模式一致时才兜底复用。
+	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
+	bt, ok := heatnote["bluetooth"].(*bluetooth.Device)
+	if !ok {
+		mock, _ := heatnote["bt_mock"].(bool)
+		if dev, has := env.Devs["bluetooth"].(*bluetooth.Device); has && !dev.IsReal() == mock {
+			bt = dev
+		} else if mock {
+			bt = bluetooth.NewMockDevice()
+		} else {
+			bt = bluetooth.NewRealDevice()
+		}
+		// 存回 vars 供后续 case 复用
+		if heatnote == nil {
+			heatnote = map[string]any{}
+			env.Vars["HeatNote"] = heatnote
+		}
+		heatnote["bluetooth"] = bt
+	}
+
+	id := _str(heatnote, "serial")
+
+	// mac 由序列号 parseIdToMac 派生；已连接则跳过重复连接，否则重试连接
+	// （Device.Connect 内部最多重试 2 次，对应 Perl ConnectBle 重试）。
+	bt.SetDevType(deviceType)
+	// 注入日志输出：发现服务/特征成功、扫描成功、连接成功都会打日志
+	bt.SetLogger(env.Log)
+
+	env.Log.Info("扫描并连接蓝牙")
+	mac := bluetooth.ParseIdToMac(id)
+	if bt.IsConnected(mac) {
+		env.Log.Info("蓝牙已连接，跳过重复连接")
+	} else if err := bt.Connect(ctx, id); err != nil {
+		return nil, "", fmt.Errorf("%w", err)
+	}
+	return bt, id, nil
 }

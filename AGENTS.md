@@ -51,4 +51,65 @@ fyne.Do(func() {
 - 每步跑相关测试（`go test ./<包>/`），全部完成后跑 `go build ./...` 与 `go test ./...` 收尾。
 - 允许用 `httptest.Server` 模拟 BLAT 服务器响应，测试 HTTP 客户端逻辑（请求 URL、Header、重试、错误判定）。
 
+## 项目结构
+
+BLAT 工厂测试框架的 Go 移植版（原 Perl），带 Fyne 桌面 GUI。模块名 `blat`，Go 1.25，Windows 平台。核心依赖：`fyne.io/fyne/v2`（GUI）、`tinygo.org/x/bluetooth`（真实 BLE）、`aliyun-oss-go-sdk`（日志上传）、`fxamacker/cbor/v2`（蓝牙协议帧编解码）、`ulikunitz/xz`（日志压缩）、`gopkg.in/yaml.v3`（配置）。
+
+```
+blat-go-fyne/
+├── cmd/hello/               # 唯一入口
+│   ├── main.go              # flag 解析、env/plan 装配、GUI 或 Console 启动、跑完释放蓝牙
+│   └── cases/               # 用例包：init() 自动 Register 到全局 Registry
+│       ├── cases.go         # global Registry + Register(name, factory)
+│       ├── sayhello.go / saybye.go / fail.go   # 演示用例（HelloSuite::*）
+│       └── wire_valve_bluetooth_test.go        # HeatSuite::* 蓝牙用例（含 _ensureBluetooth 连接复用）
+├── internal/
+│   ├── core/                # 框架核心（镜像 Perl BLAT 布局）：Case / Suite / App / Runner / Env
+│   ├── runtime/             # plan ↔ Case 装配：Registry（名字→Factory）、PlanRunner（执行+重试+上报事件）
+│   ├── config/              # YAML 加载：LoadPlan / LoadEnv / SaveEnv / CleanVars / TestModeFromPlanPath
+│   ├── device/
+│   │   ├── device.go        # 低层驱动最小契约 Device 接口（Open/Close/Command）
+│   │   └── bluetooth/       # 业务级蓝牙设备（mock/real 双模式）
+│   ├── ui/
+│   │   ├── ui.go            # Console 命令行 UI（-no-gui 模式，含日志环形缓冲 SnapshotLog）
+│   │   └── fyne/app.go      # Fyne GUI：计划下拉框、用例树、TAP 视图、配置弹框、异步弹框通道
+│   ├── report/              # Reporter 接口 + YAMLReporter / TAPReporter / MultiReporter
+│   ├── uploader/            # hook_stop 上报：日志 LZMA 压缩→OSS，测试记录 POST→BLAT 后台
+│   └── serial/              # Windows 串口枚举 ListPorts()（读注册表，无第三方库，cgo-free）
+├── confs/                   # plan_*.yml / env.yml / uploader.yml（运行配置）
+├── examples/                # 参考示例（hello、heat）
+├── bin/                     # 构建产物（hello.exe）
+└── AGENTS.md
+```
+
+### 核心流程（数据流）
+
+`cmd/hello/main.go` 加载 `confs/uploader.yml`（凭据注入 uploader）→ 加载 `--env`（默认 `confs/env.yml`，写入 `Env.Vars`）→ 注入 `Vars.HeatNote.bt_mock`（bool）与 `Vars.HeatNote.plan` → 用 `cases.Global()` 构造 `runtime.PlanRunner` → `RunPlan` 按 plan 顺序 Invoke 每个 case（counts 次）→ 每步发 Reporter 事件 → 结束后 `report.NewMulti(YAML, TAP, uploader.HookStopReporter)` 落盘 + 上报 → 跑完 `disconnectBluetooth` 释放连接。
+
+### 各包要点
+
+- **core**：`Case{Name() string; Run(ctx, env) error}`；`Env{Log, UI, Vars map[string]any, Devs map[string]any, Out}`。`Devs` 值类型是 any：低层驱动实现 `Device` 接口，业务级设备（bluetooth）把方法直接挂具体类型上，由拥有它的 Case 类型断言取用。`UI.Prompt/WaitContinue` 必须 ctx-aware（Stop 按钮/关窗时返回 ctx.Err()）。可选接口 `Configurable`：case 实现它即可在 Run 前收到 plan 里的自定义参数。
+- **runtime**：case 注册名沿用 Perl 的 `<Suite>::<Method>` 风格（如 `HeatSuite::wire_valve_bluetooth_test_all_params`），用显式 Registry 避免反射。
+- **config**：plan 为顶层 YAML 序列，保留字段 `name/title/desc/case_seq/counts/parallel`，其余键平铺进 `Args` 传给 case。`TestModeFromPlanPath` 从文件名解析模式：`confs/plan_PSAV_ut_check_state.yml` → `ut_check_state`。
+- **device/bluetooth**：**故意不实现 core.Device**。挂在 `env.Devs["bluetooth"]`（main 注入 `NewDevice()` = real）。mock/real 由 `NewMockDevice`/`NewRealDevice` 构造；`bt_mock` 标志决定 case 端选哪个。协议帧头字节：PSAV→`f9`、其它→`f8`；GATT 服务 `0xfff0`、特征 `0xfff2`。mac 由序列号经 `ParseIdToMac(id)` 派生。真实 BLE 的所有 tinygo 调用投递到专用串行 executor goroutine 依次执行（规避 Windows 上非主线程并发调用崩溃，tinygo issue #294）。常用方法：`Connect/Disconnect/Reboot/Read/ResetValve/EnableNbiot/DisableNbiot/SetDevType/SetLogger/SetMockStatus/IsConnected`。mock 默认数据保证 PSAV 流程首读通过（NbRssi≥−81 → NB ok、ValveState=0）。
+- **ui/fyne**：UI 变更一律 `fyne.Do` 上主线程；`Prompt`/`WaitContinue` 通过 `promptReq`/`confirmReq` 异步通道弹框实现；配置弹框把 MBUS 端口等持久化到 `confs/env.yml`（`config.SaveEnv`）。
+- **uploader**：`HookStopReporter` 实现 `report.Reporter`，`OnPlanStop` 时把 Console/GUI 环形缓冲的完整日志 LZMA 压缩上传 OSS，并把测试记录 POST 到 BLAT 后台（对齐 Perl `hook_stop`）；`--debug` 时不触网仅打印。`GetTestRecord` 查询整机测试记录（devType=2）。
+- **serial**：`ListPorts()` 读注册表 `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM`，按 COM 数字排序去重。刻意不用第三方串口库，保持 cgo-free。
+
+### 运行方式
+
+```powershell
+go run ./cmd/hello                                  # Fyne GUI（工具栏选择计划并开始）
+go run ./cmd/hello -no-gui --plan confs/plan_PSAV_ut_resetvalve.yml --env confs/env.yml   # 无头控制台
+go run ./cmd/hello -mock-bt=true                    # 蓝牙用 mock（无硬件调试）
+go run ./cmd/hello --debug                          # 上报只打印不触网
+```
+
+### 关键约定
+
+- **HeatNote**：`env.yml` 顶层 key，存放产线参数（`serial/lot/model/pn/mbus/tenant_id/user/bt_mock/plan` 等），case 运行期也把蓝牙实例写回 `HeatNote["bluetooth"]` 供后续 case 复用。键名大写。
+- **蓝牙连接复用**：所有蓝牙用例统一走 `_ensureBluetooth`（cases 包）：优先取 `HeatNote["bluetooth"]`；否则仅当 `Devs["bluetooth"]` 实例模式与 `bt_mock` 一致才兜底复用，再否则按 `bt_mock` 新建 mock/real 并写回。**不要**无条件 fallback 到 `env.Devs["bluetooth"]`——main 默认注入 real，会让 `-mock-bt=true` 拿不到 mock。
+- **新加用例**：在 `cmd/hello/cases/` 下新建文件，实现 `core.Case`（可加 `Configure`），`init()` 里 `Register("<Suite>::<方法名>", ...)`，然后在 plan YAML 里按名字引用。
+- **新加计划**：plan 文件放 `confs/`，按 `plan_<设备类型>_<模式>.yml` 命名；GUI 下拉框选项在 `main.go` 的 `builtinPlans` 里追加。
+
 
