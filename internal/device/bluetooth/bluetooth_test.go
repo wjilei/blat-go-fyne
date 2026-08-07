@@ -120,38 +120,55 @@ func TestBuildReadFrame(t *testing.T) {
 	}
 }
 
-// TestSetConfigFields 校验 SetConfig 帧完整字段：BLAT gen_bluetooth_data_to_send
-// 的默认字段（时间戳/BeatDur/SetOpenPre/ValveActivityInterval/ReverseFlow）
-// 叠加传入字段，后者覆盖同 tag。
-func TestSetConfigFields(t *testing.T) {
+// TestDefaultSetConfigPayload 校验 SetConfigPayload 结构体方案的默认字段：
+// BLAT gen_bluetooth_data_to_send 的时间戳/BeatDur/SetOpenPre/
+// ValveActivityInterval/ReverseFlow 默认值，未覆盖字段（CtrlType 等）为 nil。
+func TestDefaultSetConfigPayload(t *testing.T) {
 	now := time.Date(2026, 8, 6, 10, 30, 45, 0, time.Local)
-	fields := setConfigFields(now, map[int]int{12: 0x5a})
-	want := map[int]int{
-		1: 26, // Year = 2026 - 2000
-		2: 7,  // Month = 8 - 1（Perl localtime 0-11）
-		3: 6,  // Day
-		4: 10, // Hour
-		5: 30, // Minute
-		6: 45, // Second
-		7: 1380, // BeatDur = 60*23
-		8: 100,  // SetOpenPre
-		9: 30,   // ValveActivityInterval
-		11: 0,   // ReverseFlow
-		12: 0x5a, // 传入 CtrlType 覆盖
+	p := DefaultSetConfigPayload(now)
+
+	cases := []struct {
+		name string
+		got  *int
+		want int
+	}{
+		{"Year", p.Year, 26},       // 2026 - 2000
+		{"Month", p.Month, 7},      // 8 - 1（Perl localtime 0-11）
+		{"Day", p.Day, 6},          //
+		{"Hour", p.Hour, 10},       //
+		{"Minute", p.Minute, 30},   //
+		{"Second", p.Second, 45},   //
+		{"BeatDur", p.BeatDur, 1380}, // 60*23
+		{"SetOpenPre", p.SetOpenPre, 100},
+		{"ValveActivityInterval", p.ValveActivityInterval, 30},
+		{"ReverseFlow", p.ReverseFlow, 0},
 	}
-	for k, v := range want {
-		if got := fields[k]; got != v {
-			t.Errorf("setConfigFields tag %d = %d, want %d", k, got, v)
+	for _, tc := range cases {
+		if tc.got == nil {
+			t.Errorf("%s = nil, want %d", tc.name, tc.want)
+			continue
 		}
+		if *tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, *tc.got, tc.want)
+		}
+	}
+	// 未传入字段必须为 nil（omitempty 才可能省略）。
+	if p.CtrlType != nil || p.CtrlArg != nil || p.ForceCloseNBModule != nil {
+		t.Error("CtrlType/CtrlArg/ForceCloseNBModule 应为 nil（默认未设置）")
 	}
 }
 
-// TestBuildSetConfigFrame 校验配置帧构造：帧头 [0x01, devTypeByte] + CBOR。
+// TestBuildSetConfigFrame 校验配置帧构造：帧头 [0x01, devTypeByte] + CBOR(p)。
+// payload 用 map[int]int 解码成功本身即证明键是整数（keyasint）。
 // PSAV Reboot → 前缀 "01f9" 且 payload 含 tag 12=0x5a 与默认字段 tag 1；
-// PFW DisableNbiot → 前缀 "01f8" 且 payload 含 tag 10=0xb3。
+// PFW DisableNbiot → 前缀 "01f8" 且 payload 含 tag 10=0xb3；
+// PFW EnableNbiot → 前缀 "01f8" 且 tag 10=0 必须存在（回归：0 值不被吞掉）。
 func TestBuildSetConfigFrame(t *testing.T) {
+	now := time.Date(2026, 8, 6, 10, 30, 45, 0, time.Local)
 	t.Run("PSAV Reboot", func(t *testing.T) {
-		frame, err := buildSetConfigFrame("PSAV", map[int]int{12: 0x5a})
+		p := DefaultSetConfigPayload(now)
+		p.CtrlType = intPtr(0x5a)
+		frame, err := buildSetConfigFrame("PSAV", p)
 		if err != nil {
 			t.Fatalf("buildSetConfigFrame: %v", err)
 		}
@@ -171,7 +188,9 @@ func TestBuildSetConfigFrame(t *testing.T) {
 		}
 	})
 	t.Run("PFW DisableNbiot", func(t *testing.T) {
-		frame, err := buildSetConfigFrame("PFW", map[int]int{10: 0xb3})
+		p := DefaultSetConfigPayload(now)
+		p.ForceCloseNBModule = intPtr(0xb3)
+		frame, err := buildSetConfigFrame("PFW", p)
 		if err != nil {
 			t.Fatalf("buildSetConfigFrame: %v", err)
 		}
@@ -188,13 +207,26 @@ func TestBuildSetConfigFrame(t *testing.T) {
 		}
 	})
 	t.Run("PFW EnableNbiot", func(t *testing.T) {
-		frame, err := buildSetConfigFrame("PFW", map[int]int{10: 0})
+		p := DefaultSetConfigPayload(now)
+		p.ForceCloseNBModule = intPtr(0x0) // 0 是合法值，intPtr 保证不被 omitempty 吞掉
+		frame, err := buildSetConfigFrame("PFW", p)
 		if err != nil {
 			t.Fatalf("buildSetConfigFrame: %v", err)
 		}
 		got := hex.EncodeToString(frame)
 		if len(got) < 4 || got[:4] != "01f8" {
 			t.Errorf("hex = %q, want prefix \"01f8\"", got)
+		}
+		var m map[int]int
+		if err := cbor.Unmarshal(frame[2:], &m); err != nil {
+			t.Fatalf("cbor.Unmarshal payload: %v", err)
+		}
+		v, ok := m[10]
+		if !ok {
+			t.Fatal("tag 10 缺失：EnableNbiot 的 0 值被 omitempty 吞掉了")
+		}
+		if v != 0 {
+			t.Errorf("tag 10 = %d, want 0", v)
 		}
 	})
 }

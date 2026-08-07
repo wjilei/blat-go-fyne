@@ -448,7 +448,9 @@ func (d *Device) Reboot(ctx context.Context) error {
 		d.connectedSinceReboot = time.Now()
 		return nil
 	}
-	return d.setConfigReal(ctx, map[int]int{12: 0x5a})
+	p := DefaultSetConfigPayload(time.Now())
+	p.CtrlType = intPtr(0x5a)
+	return d.setConfigReal(ctx, p)
 }
 
 // Read returns the current (mock) status, defaulting Sn to the connected
@@ -513,7 +515,9 @@ func (d *Device) EnableNbiot(ctx context.Context) error {
 	if d.mock {
 		return ctxErr(ctx)
 	}
-	return d.setConfigReal(ctx, map[int]int{10: 0x0})
+	p := DefaultSetConfigPayload(time.Now())
+	p.ForceCloseNBModule = intPtr(0x0) // 0 是合法值，必须用 intPtr 保留
+	return d.setConfigReal(ctx, p)
 }
 
 // DisableNbiot turns the NB-IoT modem off. Mock: no-op.
@@ -522,7 +526,9 @@ func (d *Device) DisableNbiot(ctx context.Context) error {
 	if d.mock {
 		return ctxErr(ctx)
 	}
-	return d.setConfigReal(ctx, map[int]int{10: 0xb3})
+	p := DefaultSetConfigPayload(time.Now())
+	p.ForceCloseNBModule = intPtr(0xb3)
+	return d.setConfigReal(ctx, p)
 }
 
 // ResetValve resets the valve and restores ValveState to 0 in the mock.
@@ -537,13 +543,15 @@ func (d *Device) ResetValve(ctx context.Context) error {
 		d.status.ValveState = 0
 		return nil
 	}
-	return d.setConfigReal(ctx, map[int]int{12: 0x5b})
+	p := DefaultSetConfigPayload(time.Now())
+	p.CtrlType = intPtr(0x5b)
+	return d.setConfigReal(ctx, p)
 }
 
-// setConfigReal 在真实模式下构造 SetConfig 帧（01+devTypeByte+CBOR(fields)）
+// setConfigReal 在真实模式下构造 SetConfig 帧（01+devTypeByte+CBOR(p)）
 // 写入蓝牙，等通知响应并校验 05f[89]bf0000ff；不匹配返回 errSetConfigNack。
 // 须在 executor 内执行 writeAndRecv（BLE 调用串行化）。
-func (d *Device) setConfigReal(ctx context.Context, fields map[int]int) error {
+func (d *Device) setConfigReal(ctx context.Context, p *SetConfigPayload) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
 	}
@@ -554,7 +562,7 @@ func (d *Device) setConfigReal(ctx context.Context, fields map[int]int) error {
 		d.mu.Lock()
 		devType := d.devType
 		d.mu.Unlock()
-		frame, err := buildSetConfigFrame(devType, fields)
+		frame, err := buildSetConfigFrame(devType, p)
 		if err != nil {
 			return nil, err
 		}
@@ -775,12 +783,12 @@ func buildReadFrame(devType string) []byte {
 	return b
 }
 
-// buildSetConfigFrame 构造配置帧：[0x01, devTypeByte] + CBOR(完整字段)。
-// 完整字段 = BLAT gen_bluetooth_data_to_send 的默认字段（时间戳、BeatDur、
-// SetOpenPre、ValveActivityInterval、ReverseFlow）叠加传入 fields（后者覆盖
-// 同 tag），等价 Perl 的 marshal(默认字段 ∪ %input_args)。
-func buildSetConfigFrame(devType string, fields map[int]int) ([]byte, error) {
-	payload, err := cbor.Marshal(setConfigFields(time.Now(), fields))
+// buildSetConfigFrame 构造配置帧：[0x01, devTypeByte] + CBOR(p)。
+// p 应来自 DefaultSetConfigPayload 并覆盖所需字段；nil 字段被 omitempty
+// 省略。帧 = 01 + devTypeByte + CBOR(p)，等价 Perl 的
+// pack("H*", "01".$devtype) . marshal($args)。
+func buildSetConfigFrame(devType string, p *SetConfigPayload) ([]byte, error) {
+	payload, err := cbor.Marshal(p)
 	if err != nil {
 		return nil, err
 	}
@@ -791,33 +799,52 @@ func buildSetConfigFrame(devType string, fields map[int]int) ([]byte, error) {
 	return append(head, payload...), nil
 }
 
-// setConfigFields 生成 SetConfig 帧的完整 CBOR 字段：BLAT
-// gen_bluetooth_data_to_send 的默认字段叠加传入字段（后者覆盖同 tag）。
-// 对应 Perl（HeatDev.pm L136-148）：
+// SetConfigPayload 是 SetConfig 帧的 CBOR 载荷，字段对应 Perl
+// gen_bluetooth_data_to_send 的 tag 表（1-13）。*int + keyasint,omitempty：
+// keyasint 让数字 tag 编码为 CBOR 整数键（与 CBOR::XS 一致，设备固件按整数
+// 键解析）；omitempty + 指针保证 nil 字段省略、0 值字段保留（如 EnableNbiot
+// 的 tag10=0 必须发出）。
+type SetConfigPayload struct {
+	Year                  *int `cbor:"1,keyasint,omitempty"`
+	Month                 *int `cbor:"2,keyasint,omitempty"`
+	Day                   *int `cbor:"3,keyasint,omitempty"`
+	Hour                  *int `cbor:"4,keyasint,omitempty"`
+	Minute                *int `cbor:"5,keyasint,omitempty"`
+	Second                *int `cbor:"6,keyasint,omitempty"`
+	BeatDur               *int `cbor:"7,keyasint,omitempty"`
+	SetOpenPre            *int `cbor:"8,keyasint,omitempty"`
+	ValveActivityInterval *int `cbor:"9,keyasint,omitempty"`
+	ForceCloseNBModule    *int `cbor:"10,keyasint,omitempty"`
+	ReverseFlow           *int `cbor:"11,keyasint,omitempty"`
+	CtrlType              *int `cbor:"12,keyasint,omitempty"`
+	CtrlArg               *int `cbor:"13,keyasint,omitempty"`
+}
+
+// DefaultSetConfigPayload 返回带 BLAT 默认字段的载荷，对应 Perl
+// gen_bluetooth_data_to_send（HeatDev.pm L136-148）：
 //
 //	Year => 当前年 - 2000；Month => localtime 的 $mon（0-11）
 //	Day/Hour/Minute/Second 取当前时间；BeatDur => 60*23（23 小时）
 //	SetOpenPre => 100；ValveActivityInterval => 30；ReverseFlow => 0
 //
-// now 参数注入便于测试（生产传 time.Now()）。
-func setConfigFields(now time.Time, fields map[int]int) map[int]int {
-	all := map[int]int{
-		1:  now.Year() - 2000,
-		2:  int(now.Month()) - 1, // Perl localtime $mon 范围 0-11
-		3:  now.Day(),
-		4:  now.Hour(),
-		5:  now.Minute(),
-		6:  now.Second(),
-		7:  60 * 23, // BeatDur 23 小时
-		8:  100,     // SetOpenPre
-		9:  30,      // ValveActivityInterval
-		11: 0,       // ReverseFlow
+// now 参数注入便于测试（生产传 time.Now()）。调用方按需覆盖具体字段后传给
+// buildSetConfigFrame。
+func DefaultSetConfigPayload(now time.Time) *SetConfigPayload {
+	return &SetConfigPayload{
+		Year:                  intPtr(now.Year() - 2000),
+		Month:                 intPtr(int(now.Month()) - 1), // Perl localtime $mon 范围 0-11
+		Day:                   intPtr(now.Day()),
+		Hour:                  intPtr(now.Hour()),
+		Minute:                intPtr(now.Minute()),
+		Second:                intPtr(now.Second()),
+		BeatDur:               intPtr(60 * 23), // BeatDur 23 小时
+		SetOpenPre:            intPtr(100),
+		ValveActivityInterval: intPtr(30),
+		ReverseFlow:           intPtr(0),
 	}
-	for k, v := range fields {
-		all[k] = v
-	}
-	return all
 }
+
+func intPtr(v int) *int { return &v }
 
 // ---- 响应解析（对应 Perl BLAT parse_bluetooth_response_data）----
 
