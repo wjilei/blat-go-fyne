@@ -5,5 +5,4 @@
   case_seq: 1
   counts: 1
   desc: 蓝牙读取并检查所有参数，包括RTC，序列号，电压，流量，进回水温度，信号强度，SNR
-  设备类型: PSAV
-  蓝牙操作: read
+  设备类型: PFW

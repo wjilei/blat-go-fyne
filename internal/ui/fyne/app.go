@@ -113,6 +113,12 @@ type confirmReq struct {
 	reply chan struct{}
 }
 
+type messageReq struct {
+	msg    string
+	danger bool
+	reply  chan struct{}
+}
+
 // App is the Fyne-based UI. It implements both core.UI and core.Logger.
 type App struct {
 	fa  fyne.App
@@ -140,10 +146,11 @@ type App struct {
 	logCap     int
 	cat        string
 
-	promptCh  chan promptReq
-	confirmCh chan confirmReq
-	shutdown  chan struct{}
-	once      sync.Once
+	promptCh   chan promptReq
+	confirmCh  chan confirmReq
+	messageCh  chan messageReq
+	shutdown   chan struct{}
+	once       sync.Once
 
 	runMu  sync.Mutex
 	cancel context.CancelFunc
@@ -157,6 +164,42 @@ type App struct {
 	// 测试记录存库。供 hook_stop 上报逻辑读取。
 	debug bool
 }
+
+// keyButton 把按钮包装成可聚焦的键盘操作组件：焦点在它上面时（转调
+// Button.FocusGained 让按钮显示 focus 高亮），回车或空格都会触发按钮
+// 点击。Fyne 的 widget.Button 只响应空格（TypedKey 只处理 KeySpace），
+// 不处理回车，故需要这个包装。
+type keyButton struct {
+	widget.BaseWidget
+	btn *widget.Button
+}
+
+func newKeyButton(btn *widget.Button) *keyButton {
+	k := &keyButton{btn: btn}
+	k.ExtendBaseWidget(k)
+	return k
+}
+
+func (k *keyButton) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(k.btn)
+}
+
+func (k *keyButton) MinSize() fyne.Size { return k.btn.MinSize() }
+
+func (k *keyButton) FocusGained() { k.btn.FocusGained() }
+func (k *keyButton) FocusLost()   { k.btn.FocusLost() }
+
+func (k *keyButton) AcceptsTab() bool { return true }
+
+// TypedKey 在按钮获得焦点时拦截回车与空格，触发按钮点击。
+func (k *keyButton) TypedKey(ev *fyne.KeyEvent) {
+	if ev.Name == fyne.KeyReturn || ev.Name == fyne.KeySpace {
+		k.btn.OnTapped()
+	}
+}
+
+// TypedRune 满足 fyne.Focusable 接口；按钮无需处理字符输入。
+func (k *keyButton) TypedRune(rune) {}
 
 // New constructs and shows the main window. Call Run to start the Fyne
 // event loop. The returned App is safe to use from any goroutine; all UI
@@ -177,6 +220,7 @@ func New(title string) *App {
 		varsFile:  "confs/env.yml",
 		promptCh:  make(chan promptReq, 8),
 		confirmCh: make(chan confirmReq, 8),
+		messageCh: make(chan messageReq, 8),
 		shutdown:  make(chan struct{}),
 	}
 	a.build()
@@ -450,13 +494,58 @@ func (a *App) startPump() {
 				})
 			case req := <-a.confirmCh:
 				fyne.Do(func() {
-					d := dialog.NewConfirm("请继续", req.msg, func(_ bool) {
+					// 双按钮确认框：确定（keyButton，获得焦点）+ 取消。
+					// 与旧 dialog.NewConfirm 行为一致：点任意按钮都会发
+					// reply 让 WaitContinue 返回 nil（旧回调忽略 ok 参数）。
+					var popup *widget.PopUp
+					okBtn := widget.NewButton("确定", func() {
+						popup.Hide()
 						select {
 						case req.reply <- struct{}{}:
 						case <-a.shutdown:
 						}
-					}, a.win)
-					d.Show()
+					})
+					cancelBtn := widget.NewButton("取消", func() {
+						popup.Hide()
+						select {
+						case req.reply <- struct{}{}:
+						case <-a.shutdown:
+						}
+					})
+					okKB := newKeyButton(okBtn)
+					title := widget.NewLabelWithStyle("请继续", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+					msgLabel := widget.NewLabel(req.msg)
+					buttonRow := container.NewHBox(layout.NewSpacer(), cancelBtn, okKB)
+					content := container.NewVBox(title, widget.NewSeparator(), msgLabel, buttonRow)
+					padded := container.New(layout.NewPaddedLayout(), content)
+					popup = widget.NewModalPopUp(padded, a.win.Canvas())
+					popup.Show()
+					fyne.Do(func() { a.win.Canvas().Focus(okKB) })
+				})
+			case req := <-a.messageCh:
+				fyne.Do(func() {
+					// 纯消息框：只有"确定"按钮，无取消。danger 时消息文字
+					// 用错误色（红色）渲染，用于醒目提醒。
+					msgLabel := widget.NewLabel(req.msg)
+					if req.danger {
+						msgLabel.Importance = widget.DangerImportance // 红色
+					}
+					var popup *widget.PopUp
+					okBtn := widget.NewButton("确定", func() {
+						popup.Hide()
+						select {
+						case req.reply <- struct{}{}:
+						case <-a.shutdown:
+						}
+					})
+					okKB := newKeyButton(okBtn)
+					title := widget.NewLabelWithStyle("提示", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+					buttonRow := container.NewHBox(layout.NewSpacer(), okKB)
+					content := container.NewVBox(title, widget.NewSeparator(), msgLabel, buttonRow)
+					padded := container.New(layout.NewPaddedLayout(), content)
+					popup = widget.NewModalPopUp(padded, a.win.Canvas())
+					popup.Show()
+					fyne.Do(func() { a.win.Canvas().Focus(okKB) })
 				})
 			}
 		}
@@ -1316,6 +1405,27 @@ func (a *App) WaitContinue(ctx context.Context, msg string) error {
 	req := confirmReq{msg: msg, reply: make(chan struct{}, 1)}
 	select {
 	case a.confirmCh <- req:
+	case <-a.shutdown:
+		return fmt.Errorf("ui shutdown")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-req.reply:
+		return nil
+	case <-a.shutdown:
+		return fmt.Errorf("ui shutdown")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Message blocks until the user confirms the single-button dialog, ctx is
+// done, or the window closes. danger renders the message in the error color.
+func (a *App) Message(ctx context.Context, msg string, danger bool) error {
+	req := messageReq{msg: msg, danger: danger, reply: make(chan struct{}, 1)}
+	select {
+	case a.messageCh <- req:
 	case <-a.shutdown:
 		return fmt.Errorf("ui shutdown")
 	case <-ctx.Done():

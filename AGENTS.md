@@ -51,6 +51,17 @@ fyne.Do(func() {
 - 每步跑相关测试（`go test ./<包>/`），全部完成后跑 `go build ./...` 与 `go test ./...` 收尾。
 - 允许用 `httptest.Server` 模拟 BLAT 服务器响应，测试 HTTP 客户端逻辑（请求 URL、Header、重试、错误判定）。
 
+## 用例文件名不要以 _test.go 结尾
+
+**规则**：`cmd/hello/cases/` 下实现用例的 .go 文件**绝不能**以 `_test.go` 结尾（如 `wire_valve_bluetooth_test.go`）。
+
+**原因**：`_test.go` 后缀是 Go 约定的测试文件命名，Go 工具链只会在 `go test` 时编译它，`go build` / `go run` / 产出的 exe **完全排除**这类文件。用例靠 `init()` 里的 `Register` 注册，文件不进 exe → 运行时报 `case not registered: <Suite>::<Method>`，但 `go test ./cmd/hello/cases/` 却一切正常（测试二进制含该文件），极难定位。
+
+**注意**：
+- 纯用例实现文件（含 `init() Register` 与辅助函数）命名为 `xxx.go`（如 `wire_valve_bluetooth.go`），不带 `_test`。
+- 真正的测试文件（`func Test*`）仍必须用 `_test.go` 后缀——两者不要混在一个文件里。
+- 排查 `case not registered` 时先检查文件名，再用 `go run`（非 `go test`）验证注册表。
+
 ## 项目结构
 
 BLAT 工厂测试框架的 Go 移植版（原 Perl），带 Fyne 桌面 GUI。模块名 `blat`，Go 1.25，Windows 平台。核心依赖：`fyne.io/fyne/v2`（GUI）、`tinygo.org/x/bluetooth`（真实 BLE）、`aliyun-oss-go-sdk`（日志上传）、`fxamacker/cbor/v2`（蓝牙协议帧编解码）、`ulikunitz/xz`（日志压缩）、`gopkg.in/yaml.v3`（配置）。
@@ -62,7 +73,7 @@ blat-go-fyne/
 │   └── cases/               # 用例包：init() 自动 Register 到全局 Registry
 │       ├── cases.go         # global Registry + Register(name, factory)
 │       ├── sayhello.go / saybye.go / fail.go   # 演示用例（HelloSuite::*）
-│       └── wire_valve_bluetooth_test.go        # HeatSuite::* 蓝牙用例（含 _ensureBluetooth 连接复用）
+│       └── wire_valve_bluetooth.go             # HeatSuite::* 蓝牙用例（含 _ensureBluetooth 连接复用）
 ├── internal/
 │   ├── core/                # 框架核心（镜像 Perl BLAT 布局）：Case / Suite / App / Runner / Env
 │   ├── runtime/             # plan ↔ Case 装配：Registry（名字→Factory）、PlanRunner（执行+重试+上报事件）

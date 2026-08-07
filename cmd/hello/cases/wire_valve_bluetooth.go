@@ -15,8 +15,7 @@ import (
 // 流程：连接蓝牙 → 重启 → 循环读取校验 NB 信号 → 校验软件版本/序列号/
 // 管径/电压/流量/温度，PSAV 分支再等待阀门状态。
 type WireValveBluetoothTestAllParamsCase struct {
-	deviceType  string // 设备类型：PFW / PSAV
-	bluetoothOp string // 蓝牙操作：read（预留）
+	deviceType string // 设备类型：PFW / PSAV
 }
 
 func (c *WireValveBluetoothTestAllParamsCase) Name() string {
@@ -32,12 +31,6 @@ func (c *WireValveBluetoothTestAllParamsCase) Configure(args map[string]any) err
 	}
 	if c.deviceType == "" {
 		c.deviceType = "PSAV"
-	}
-	if v, ok := args["蓝牙操作"].(string); ok && v != "" {
-		c.bluetoothOp = v
-	}
-	if c.bluetoothOp == "" {
-		c.bluetoothOp = "read"
 	}
 	return nil
 }
@@ -162,6 +155,9 @@ func init() {
 	Register("HeatSuite::wire_valve_bluetooth_reset_valve", func() (core.Case, error) {
 		return &WireValveBluetoothResetValveCase{}, nil
 	})
+	Register("HeatSuite::wire_valve_observe_valve", func() (core.Case, error) {
+		return &WireValveObserveValveCase{}, nil
+	})
 }
 
 // WireValveBluetoothResetValveCase 翻译自 Perl
@@ -199,6 +195,24 @@ func (c *WireValveBluetoothResetValveCase) Run(ctx context.Context, env *core.En
 		return fmt.Errorf("重置阀门失败: %w", err)
 	}
 	env.Log.Info("重置阀门成功")
+	return nil
+}
+
+// WireValveObserveValveCase 提示操作员观察阀门状态。
+// 用于重置阀门（bluetooth_reset_valve）之后人工确认执行器是否动作：
+// 通过 UI 弹出提示信息，等待操作员观察后确认继续（GUI 弹框 / Console 回车）。
+type WireValveObserveValveCase struct{}
+
+func (c *WireValveObserveValveCase) Name() string {
+	return "wire_valve_observe_valve"
+}
+
+func (c *WireValveObserveValveCase) Run(ctx context.Context, env *core.Env) error {
+	// 触发 UI 提示；ctx-aware（Stop/关窗时返回 ctx.Err()）
+	if err := env.UI.Message(ctx, "请观察阀门是否转动，确认后继续", true); err != nil {
+		return err
+	}
+	env.Log.Info("已确认观察阀门")
 	return nil
 }
 

@@ -114,3 +114,14 @@ func (c *Console) WaitContinue(ctx context.Context, msg string) error {
 		return ctx.Err()
 	}
 }
+
+// Message 打印消息并等待回车（Console 无颜色能力；danger 时用 Error 级别
+// 打印体现红色语义）。
+func (c *Console) Message(ctx context.Context, msg string, danger bool) error {
+	if danger {
+		c.Error(msg)
+	} else {
+		c.Info(msg)
+	}
+	return c.WaitContinue(ctx, msg)
+}
