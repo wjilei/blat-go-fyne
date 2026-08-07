@@ -1,8 +1,0 @@
-# 通过蓝牙测试（Heat 套件示例）
-# 运行：.\bin\hello.exe -no-gui --plan .\examples\heat\plan.yml --env .\examples\heat\vars.yml
-- name: HeatSuite::wire_valve_bluetooth_test_all_params
-  title: 通过蓝牙测试
-  case_seq: 1
-  counts: 1
-  desc: 蓝牙读取并检查所有参数，包括RTC，序列号，电压，流量，进回水温度，信号强度，SNR
-  设备类型: PFW
