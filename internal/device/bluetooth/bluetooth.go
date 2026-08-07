@@ -850,8 +850,9 @@ func intPtr(v int) *int { return &v }
 
 // parseStatus 解析读响应：hex 化后跳过前 4 个 hex 字符（前 2 字节帧头），
 // 剩余字节 pack 回字节做 CBOR 解码（map[interface{}]interface{}），按数字
-// tag 映射到 Status。Sn(tag 25) 可能是 string 或 []byte。解码失败返回 nil
-// （对应 Perl 的 undef 路径）。
+// tag 映射到 Status。Sn(tag 25) 可能是 string 或 []byte（设备固件两种都
+// 发过，map 路径 + snToString 兼容两种；cbor tag 直解不支持 byte string）。
+// 解码失败返回 nil（对应 Perl 的 undef 路径）。
 func parseStatus(raw []byte) *Status {
 	if len(raw) == 0 {
 		return nil

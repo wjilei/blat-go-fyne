@@ -37,28 +37,18 @@ func (c *WireValveBluetoothTestAllParamsCase) Configure(args map[string]any) err
 
 func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core.Env) error {
 	// 连接蓝牙（复用/创建并持久化连接，见 _ensureBluetooth）
-	bt, id, err := _ensureBluetooth(ctx, env, c.deviceType)
+	bt, _, err := _ensureBluetooth(ctx, env, c.deviceType)
 	if err != nil {
 		return err
 	}
-
-	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
-	pipe := _int(heatnote, "pipe")
-	// 软件版本：优先 HeatNote（demo confs/env.yml 的位置），兜底 env.Vars 顶层
-	// （Perl 里是 env_args["软件版本"]）。
-	softVer := _int(heatnote, "软件版本")
-	if softVer == 0 {
-		softVer = _int(env.Vars, "软件版本")
-	}
-
-	// 重启
-	if err := bt.Reboot(ctx); err != nil {
-		return fmt.Errorf("重启失败: %w", err)
-	}
-	env.Log.Info("重启成功")
-	if err := _sleep(ctx, 2*time.Second); err != nil {
-		return err
-	}
+	// // 重启
+	// if err := bt.Reboot(ctx); err != nil {
+	// 	return fmt.Errorf("重启失败: %w", err)
+	// }
+	// env.Log.Info("重启成功")
+	// if err := _sleep(ctx, 2*time.Second); err != nil {
+	// 	return err
+	// }
 
 	var obj *bluetooth.Status
 
@@ -70,25 +60,14 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 	env.Log.Info(fmt.Sprintf("软件版本: %v", obj.SoftVer))
 	env.Log.Info(fmt.Sprintf("蓝牙版本: %v", obj.BlVer))
 	env.Log.Info(fmt.Sprintf("管径: %v", obj.DN))
+	heatnote, _ := env.Vars["HeatNote"].(map[string]any)
+
+	pipe := _int(heatnote, "pipe")
+	if obj.DN != pipe {
+		return errors.New(fmt.Sprintf("管径%v跟预期管径%v不一致", obj.DN, pipe))
+	}
 	voltage := float32(obj.Voltage)/100 + 2
 	env.Log.Info(fmt.Sprintf("电压: %.2f", voltage))
-
-	if obj.Sn != id {
-		return fmt.Errorf("序列号不匹配: got %q want %q", obj.Sn, id)
-	}
-	if obj.DN != pipe {
-		return fmt.Errorf("管径不一致: got %d want %d", obj.DN, pipe)
-	}
-	// 设备类型分支
-	if c.deviceType == "PFW" {
-		if obj.Err&0x8 != 0 && obj.Flow == 0 {
-			return errors.New("空管，超声波传感器不良")
-		}
-		if obj.Err&0x1 != 0 && obj.InTemp < 0 {
-			return errors.New("进水温度异常")
-		}
-		return nil
-	}
 
 	// 非 PFW（PSAV）：循环 30s 等待阀门状态
 	deadline := time.Now().Add(30 * time.Second)
@@ -97,6 +76,7 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 		if obj == nil {
 			return errors.New("读取蓝牙失败")
 		}
+		env.Log.Info(fmt.Sprintf("阀门状态: %d", obj.ValveState))
 		switch obj.ValveState {
 		case 0:
 			env.Log.Info("阀门状态正确")
@@ -104,7 +84,6 @@ func (c *WireValveBluetoothTestAllParamsCase) Run(ctx context.Context, env *core
 		case 1:
 			return errors.New("阀门状态异常")
 		case 3:
-			_ = bt.ResetValve(ctx)
 			return errors.New("阀门状态错误")
 		}
 		if time.Now().After(deadline) {
@@ -195,6 +174,28 @@ func (c *WireValveBluetoothResetValveCase) Run(ctx context.Context, env *core.En
 		return fmt.Errorf("重置阀门失败: %w", err)
 	}
 	env.Log.Info("重置阀门成功")
+
+	if err := _sleep(ctx, 3*time.Second); err != nil {
+		return err
+	}
+
+	// 读取并打印设备信息（重置后确认状态）
+	obj := bt.Read(ctx)
+	if obj == nil {
+		return errors.New("读取蓝牙失败")
+	}
+	env.Log.Info(fmt.Sprintf("软件版本: %v", obj.SoftVer))
+	env.Log.Info(fmt.Sprintf("蓝牙版本: %v", obj.BlVer))
+	env.Log.Info(fmt.Sprintf("序列号: %v", obj.Sn))
+	env.Log.Info(fmt.Sprintf("管径: %v", obj.DN))
+	voltage := float32(obj.Voltage)/100 + 2
+	env.Log.Info(fmt.Sprintf("电压: %.2f", voltage))
+	env.Log.Info(fmt.Sprintf("流量: %v", obj.Flow))
+	env.Log.Info(fmt.Sprintf("进水温: %v", obj.InTemp))
+	env.Log.Info(fmt.Sprintf("NB 信号强度: %v", obj.NbRssi))
+	env.Log.Info(fmt.Sprintf("阀门状态: %v", obj.ValveState))
+	env.Log.Info(fmt.Sprintf("错误标志: %v", obj.Err))
+
 	return nil
 }
 

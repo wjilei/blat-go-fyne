@@ -11,34 +11,50 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"blat/internal/logfile"
 )
 
 // Console is a blocking, line-based UI used as the default reference
 // implementation. It satisfies both core.UI and core.Logger.
+//
+// 日志链路对齐 Perl BLAT：全部日志写 test.log（run_dir/test.log），
+// SnapshotLog 从文件读全量供上报；同时保留 stdout 打印（无头模式的可视
+// 输出）与内存环形缓冲（NewConsoleWith 测试构造时不建文件，回退用）。
 type Console struct {
-	r   *bufio.Reader
-	w   io.Writer
-	log io.Writer
+	r    *bufio.Reader
+	w    io.Writer
+	log  io.Writer
+	file *logfile.FileLogger // 日志文件；NewConsoleWith 不建文件时为 nil
 
-	mu   sync.Mutex
-	buf  []string // 日志环形缓冲，供上报逻辑（hook_stop）取完整日志
-	cap  int
+	mu  sync.Mutex
+	buf []string // 日志环形缓冲，文件不可用时兜底供上报
+	cap int
 }
 
 // NewConsole returns a Console that reads from stdin and writes prompts to
 // stdout. The log writer is also stdout by default; pass NewConsoleWith to
-// redirect it.
+// redirect it. 日志文件 test.log 在打开时清空重写（Console 模式每次进程
+// 启动视为一次运行；GUI 模式由 App.startRun 每次点击"开始测试"清空）。
 func NewConsole() *Console {
-	return &Console{
+	c := &Console{
 		r:   bufio.NewReader(os.Stdin),
 		w:   os.Stdout,
 		log: os.Stdout,
 		cap: 1000,
 	}
+	if f, err := logfile.Open("test.log"); err == nil {
+		_ = f.Truncate()
+		c.file = f
+	} else {
+		fmt.Fprintln(os.Stderr, "open test.log:", err)
+	}
+	return c
 }
 
 // NewConsoleWith allows redirecting the log channel separately from the
-// prompt channel, which is useful in tests.
+// prompt channel, which is useful in tests. 不建日志文件：写日志、但
+// SnapshotLog 回退到内存环形缓冲。
 func NewConsoleWith(in io.Reader, promptOut, logOut io.Writer) *Console {
 	return &Console{
 		r:   bufio.NewReader(in),
@@ -48,13 +64,17 @@ func NewConsoleWith(in io.Reader, promptOut, logOut io.Writer) *Console {
 	}
 }
 
-func (c *Console) Info(s string)  { c.logLine("[INFO]", s) }
-func (c *Console) Warn(s string)  { c.logLine("[WARN]", s) }
-func (c *Console) Error(s string) { c.logLine("[ERROR]", s) }
+func (c *Console) Info(s string)  { c.logLine("info", s) }
+func (c *Console) Warn(s string)  { c.logLine("warn", s) }
+func (c *Console) Error(s string) { c.logLine("error", s) }
 
-func (c *Console) logLine(prefix, s string) {
-	line := prefix + " " + s
+func (c *Console) logLine(level, s string) {
+	line := "[" + strings.ToUpper(level) + "] " + s
 	fmt.Fprintln(c.log, line)
+	if c.file != nil {
+		// 文件行格式与 GUI 一致（15:04:05,000 LEVEL CATEGORY - msg）。
+		_ = c.file.WriteLine(level, "CONSOLE", s)
+	}
 	c.mu.Lock()
 	c.buf = append(c.buf, line)
 	if len(c.buf) > c.cap {
@@ -63,9 +83,13 @@ func (c *Console) logLine(prefix, s string) {
 	c.mu.Unlock()
 }
 
-// SnapshotLog 返回已缓冲的日志行（按时间顺序，每行以换行结尾）。
+// SnapshotLog 返回当前全部日志行（按时间顺序，每行以换行结尾）。
 // 供上报逻辑（hook_stop 上传 OSS/存库）在计划结束后取完整日志使用。
+// 文件日志方案下直接读 test.log 全量；文件不可用时回退内存环形缓冲。
 func (c *Console) SnapshotLog() string {
+	if c.file != nil {
+		return c.file.Snapshot()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.Join(c.buf, "\n") + "\n"

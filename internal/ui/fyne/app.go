@@ -40,6 +40,7 @@ import (
 	"context"
 	"fmt"
 	"image/color"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -50,9 +51,11 @@ import (
 	"blat/internal/config"
 	"blat/internal/core"
 	"blat/internal/device/bluetooth"
+	"blat/internal/logfile"
 	"blat/internal/report"
 	"blat/internal/runtime"
 	"blat/internal/serial"
+	"blat/internal/st"
 	"blat/internal/uploader"
 
 	"fyne.io/fyne/v2"
@@ -65,8 +68,6 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
-
-const defaultLogCap = 1000
 
 // Tree 节点 ID：根+两个分支用 sentinel ID，case 子节点用 "case:<idx>" 前缀。
 const (
@@ -89,13 +90,8 @@ type PlanItem struct {
 	Path string // plan.yml 路径（相对工作目录）
 }
 
-// logEntry is one ring-buffer record. The widget renders one colored
-// RichText segment per entry.
-type logEntry struct {
-	Level    string
-	Category string
-	Text     string
-}
+// readOnlyEntry 已废弃：日志框改用 SelectableRichText（RichText 渲染彩色
+// 日志 + 可选择复制）。若需只读 Entry 弹框请重新引入。
 
 type promptReq struct {
 	label string
@@ -124,7 +120,7 @@ type App struct {
 	fa  fyne.App
 	win fyne.Window
 
-	log       *widget.RichText
+	log       *SelectableRichText
 	logScroll *container.Scroll
 	tree      *widget.Tree
 	status    *widget.Label
@@ -142,15 +138,16 @@ type App struct {
 	mu         sync.Mutex
 	tapPartial bytes.Buffer // 暂存未完成（无换行结尾）的 TAP 半行
 	rows       []row
-	logBuf     []logEntry
-	logCap     int
+	logf       *logfile.FileLogger // 文件日志（test.log，见 New）；Open 失败时为 nil
+	logOff     int64               // 上次刷新读到的文件字节位置（仅主线程访问）
+	logGen     int                 // 上次刷新读到的文件世代号（仅主线程访问）
 	cat        string
 
-	promptCh   chan promptReq
-	confirmCh  chan confirmReq
-	messageCh  chan messageReq
-	shutdown   chan struct{}
-	once       sync.Once
+	promptCh  chan promptReq
+	confirmCh chan confirmReq
+	messageCh chan messageReq
+	shutdown  chan struct{}
+	once      sync.Once
 
 	runMu  sync.Mutex
 	cancel context.CancelFunc
@@ -213,10 +210,27 @@ func New(title string) *App {
 	// 工厂车间多为浅色屏幕；固定浅色主题，避免系统深色模式下日志对比度过低。
 	fa.Settings().SetTheme(theme.LightTheme())
 	win := fa.NewWindow(title)
+	// 日志文件 test.log 放当前工作目录（对齐 Perl run_dir/test.log）。
+	// 启动时不截断——旧日志保留在文件里，首次刷新从文件末尾增量读，
+	// 不把上次运行的内容灌进 UI；每次点击"开始测试"由 startRun 截断。
+	logf, lerr := logfile.Open("test.log")
+	if lerr != nil {
+		fmt.Fprintln(os.Stderr, "open test.log:", lerr)
+		logf = nil
+	}
+	var logOff int64
+	var logGen int
+	if logf != nil {
+		// 首次增量读：跳过文件已有内容，只取文件长度与世代号，
+		// 保证上次运行遗留的旧日志不会出现在日志框里。
+		_, logOff, logGen, _ = logf.TailFrom(0, 0)
+	}
 	a := &App{
 		fa:        fa,
 		win:       win,
-		logCap:    defaultLogCap,
+		logf:      logf,
+		logOff:    logOff,
+		logGen:    logGen,
 		varsFile:  "confs/env.yml",
 		promptCh:  make(chan promptReq, 8),
 		confirmCh: make(chan confirmReq, 8),
@@ -345,9 +359,10 @@ func (l minWidthLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 }
 
 func (a *App) build() {
-	a.log = widget.NewRichText()
-	a.log.Wrapping = fyne.TextWrapWord
-	a.logScroll = container.NewVScroll(a.log)
+	a.log = NewSelectableRichText()
+	// 双向滚动：日志长行横向可滚（TextWrapOff 不折行）；选择矩形与
+	// 文本同在内容区，随滚动保持一致。
+	a.logScroll = container.NewScroll(a.log)
 	a.status = widget.NewLabel("就绪")
 	a.prog = widget.NewProgressBar()
 
@@ -792,20 +807,34 @@ func (a *App) setPlanVar(path string) {
 }
 
 // setSerialVar 把启动弹框输入的序列号写入 env.Vars["HeatNote"]["serial"]，
-// 供 case 运行时读取。env 尚未 Attach 时直接返回。该值是临时运行状态，
-// 不随配置落盘持久化（与 plan 一致）。
-func (a *App) setSerialVar(serial string) {
+// 并从序列号解出 ST 值、按映射表查出管径写入 HeatNote["pipe"]（无管径族
+// 写 0），供 case 运行时读取（与蓝牙读回的 DN 比较）。ST 不在映射表时
+// 返回错误（调用方保持弹框让用户重输）。env 尚未 Attach 时直接返回。
+// 该值是临时运行状态，不随配置落盘持久化（与 plan 一致）。
+func (a *App) setSerialVar(serial string) error {
+	// 序列号格式已由弹框校验，这里解析失败只可能是 ST 不在映射表
+	pipeStr, ok := st.PipeFromSerial(serial)
+	if !ok {
+		return fmt.Errorf("序列号 ST 值不在映射表中，无法确定管径")
+	}
+	// 无管径族（ST 对应 ""）写 0，与 case 端 _int 读取、DN 比较的语义一致
+	pipe := 0
+	if pipeStr != "" {
+		pipe, _ = strconv.Atoi(pipeStr)
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.env == nil {
-		return
+		return nil
 	}
 	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
 	if hn == nil {
 		hn = map[string]any{}
 	}
 	hn["serial"] = serial
+	hn["pipe"] = pipe
 	a.env.Vars["HeatNote"] = hn
+	return nil
 }
 
 // applyTestRecord 把开始测试前查询到的整机测试记录字段写入
@@ -1016,10 +1045,18 @@ func (a *App) promptSerialThenRun() {
 		case !serialFormatRe.MatchString(text):
 			errLabel.SetText("序列号格式不对，应为可选 W 开头后接 12 位数字")
 		default:
+			// 序列号格式合法，但 ST 值不在映射表时同样保持弹框让用户重输
+			if err := a.setSerialVar(text); err != nil {
+				errLabel.SetText(err.Error())
+				errLabel.Show()
+				fyne.Do(func() {
+					a.win.Canvas().Focus(entry)
+				})
+				return
+			}
 			if popup != nil {
 				popup.Hide()
 			}
-			a.setSerialVar(text)
 			a.SetStatus("正在查询测试记录: " + text)
 			go a.queryRecordThenRun(text)
 			return
@@ -1067,6 +1104,21 @@ func (a *App) promptSerialThenRun() {
 // goroutine. It is invoked by the toolbar Start button; pressing it again
 // while a run is active cancels the old run via StartRun and restarts.
 func (a *App) startRun() {
+	// 每次点击"开始测试"：清空重写日志文件（对齐 Perl DisplayRole
+	// test_start 的 `open $logfh, "+>"` 清空重写），并清空界面日志框。
+	// startRun 在主线程执行（按钮回调 / queryRecordThenRun 的 fyne.Do），
+	// 与 refreshLog 串行；Truncate 使文件世代号递增，在途的旧增量读会
+	// 因 gen 不一致自动从头读（TailFrom 的 cleared 兜底）。
+	if a.logf != nil {
+		_ = a.logf.Truncate()
+	}
+	a.logOff = 0
+	a.logGen++
+	fyne.Do(func() {
+		a.log.Clear()
+		a.logScroll.ScrollToBottom()
+	})
+
 	a.mu.Lock()
 	plan, env, reg := a.plan, a.env, a.reg
 	a.mu.Unlock()
@@ -1224,7 +1276,7 @@ func (a *App) appendTAPLine(line string) {
 }
 
 // classifyTAPLine 决定 TAP 行的 log level。返回 "info|warn|error|debug"，
-// 由 colorForEntry 统一配色。
+// 该 level 写入日志文件（文件方案不再按 level 配色，仅区分内容）。
 func classifyTAPLine(line string) string {
 	switch {
 	case strings.HasPrefix(line, "ok "):
@@ -1295,66 +1347,96 @@ func (a *App) category() string {
 	return a.cat
 }
 
-// SnapshotLog 返回环形缓冲中当前全部日志行（按时间顺序，每行以换行结尾）。
-// 供上报逻辑（hook_stop 上传 OSS/存库）在计划结束后取完整日志使用。
-// 加锁拷贝，可安全地从 runner goroutine 调用。
+// SnapshotLog 返回日志文件当前全部内容（每行以换行结尾），供上报逻辑
+// （hook_stop 上传 OSS/存库）在计划结束后取完整日志使用。文件日志方案
+// 下直接读 test.log 全量，不再维护内存环形缓冲。
 func (a *App) SnapshotLog() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var b strings.Builder
-	for _, e := range a.logBuf {
-		b.WriteString(e.Text)
-		b.WriteByte('\n')
+	if a.logf == nil {
+		return ""
 	}
-	return b.String()
+	return a.logf.Snapshot()
 }
 
-func (a *App) clearLog() {
-	a.mu.Lock()
-	a.logBuf = a.logBuf[:0]
-	a.mu.Unlock()
-	fyne.Do(func() {
-		a.log.Segments = a.log.Segments[:0]
-		a.log.Refresh()
-	})
-}
-
-// appendLog records one entry into the ring buffer and appends a matching
-// colored segment to the RichText widget. It is safe to call from any
-// goroutine; the widget mutation is marshalled onto the Fyne main thread
-// via fyne.Do.
+// appendLog 写一行日志到 test.log，并调度主线程从文件增量刷新日志框。
+// 可安全地从任意 goroutine 调用；文件写入由 logfile 内部锁串行化，
+// UI 刷新经 fyne.Do 回到 Fyne 主线程执行。
+//
+// 行格式对齐 Perl BLAT::Core::LogAnyConf.pm 的 PatternLayout：
+//
+//	%d{ABSOLUTE} %p %x %c %L - %m%n
+//
+// 时间戳与大小写转换在 logfile.WriteLine 内部完成。
 func (a *App) appendLog(level, category, s string) {
-	// 严格按 Perl BLAT::Core::LogAnyConf.pm 的 PatternLayout 输出：
-	//   %d{ABSOLUTE} %p %x %c %L - %m%n
-	// Go 侧无 NDC(%x) 与行号(%L)，用 ABSOLUTE 时间 + 大写 level + category
-	// 替代；`-` 分隔符照搬。时间戳用 Log4perl ABSOLUTE（HH:mm:ss,SSS），
-	// 不用 ISO8601/RFC3339（与 Perl 实际输出一致）。
-	ts := time.Now().Format("15:04:05,000")
-	text := fmt.Sprintf("%s %s %s - %s", ts, strings.ToUpper(level), category, s)
-	entry := logEntry{Level: level, Category: category, Text: text}
-	a.mu.Lock()
-	a.logBuf = append(a.logBuf, entry)
-	if len(a.logBuf) > a.logCap {
-		// drop oldest in one slice op
-		a.logBuf = a.logBuf[len(a.logBuf)-a.logCap:]
+	if a.logf != nil {
+		_ = a.logf.WriteLine(level, category, s)
 	}
-	a.mu.Unlock()
-	fyne.Do(func() {
-		a.log.Segments = append(a.log.Segments, &widget.TextSegment{
-			Style: widget.RichTextStyle{
-				ColorName: colorForEntry(level, category),
-				SizeName:  theme.SizeNameText,
-			},
-			Text: text,
-		})
-		// keep the widget in sync with the ring-buffer cap
-		if len(a.log.Segments) > a.logCap {
-			a.log.Segments = a.log.Segments[len(a.log.Segments)-a.logCap:]
+	fyne.Do(a.refreshLog)
+}
+
+// refreshLog 从 test.log 增量读取新内容追加到日志框（对齐 Perl
+// DisplayRole 的 poll_log_tick 轮询刷新）。检测到文件被截断重写
+// （startRun 清空）时先清空日志框再从头读。仅 Fyne 主线程调用
+// （经 fyne.Do），a.logOff/a.logGen 只在这里读写，无需加锁。
+func (a *App) refreshLog() {
+	if a.logf == nil || a.log == nil {
+		return
+	}
+	text, size, gen, cleared := a.logf.TailFrom(a.logOff, a.logGen)
+	if cleared {
+		a.log.Clear()
+	}
+	if text != "" {
+		// 按行拆分（兼容 CRLF），解析出 level/category 恢复配色；
+		// 连续同色行合并为一段，段间用换行分隔（末尾不留换行，
+		// SelectableRichText 的行条目不含尾随换行符）。
+		var cur strings.Builder
+		curColor := theme.ColorNameForeground
+		curColorValid := false
+		flush := func() {
+			if cur.Len() > 0 {
+				a.log.AppendSegment(curColor, cur.String())
+				cur.Reset()
+			}
 		}
-		a.log.Refresh()
-		// auto-scroll to bottom
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				continue
+			}
+			color := theme.ColorNameForeground
+			if level, category, ok := parseLogLine(line); ok {
+				color = colorForEntry(level, category)
+			}
+			if curColorValid && color != curColor {
+				flush()
+			}
+			if cur.Len() > 0 {
+				cur.WriteByte('\n')
+			}
+			cur.WriteString(line)
+			curColor = color
+			curColorValid = true
+		}
+		flush()
+	}
+	a.logOff = size
+	a.logGen = gen
+	if text != "" || cleared {
 		a.logScroll.ScrollToBottom()
-	})
+	}
+}
+
+// parseLogLine 解析日志文件行（格式见 logfile.WriteLine）：
+// "15:04:05,000 LEVEL CATEGORY - msg"。返回小写 level 与 category；
+// 解析失败返回 ok=false（按默认前景色显示）。
+var logLineRe = regexp.MustCompile(`^(\d{2}:\d{2}:\d{2},\d{3}) (\w+) (\w+) - (.*)$`)
+
+func parseLogLine(line string) (level, category string, ok bool) {
+	m := logLineRe.FindStringSubmatch(line)
+	if m == nil {
+		return "", "", false
+	}
+	return strings.ToLower(m[2]), m[3], true
 }
 
 // colorForEntry maps a (level, category) pair to a theme color name.

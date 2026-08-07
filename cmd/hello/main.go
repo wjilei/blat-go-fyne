@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"blat/cmd/hello/cases"
 	"blat/internal/config"
@@ -36,6 +37,7 @@ import (
 	"blat/internal/device/bluetooth"
 	"blat/internal/report"
 	"blat/internal/runtime"
+	"blat/internal/st"
 	"blat/internal/ui"
 	fyneui "blat/internal/ui/fyne"
 	"blat/internal/uploader"
@@ -135,6 +137,19 @@ func main() {
 		heatnote["plan"] = *planPath
 	} else {
 		delete(heatnote, "plan")
+	}
+
+	// 从 env.yml 预置序列号解出 ST 并查映射表，把管径写入 HeatNote["pipe"]
+	// （无管径族写 0）。GUI 运行时扫入新序列号会经 setSerialVar 重新解析
+	// 覆盖该值；这里保证 console 模式与 GUI 初始态都有正确的管径。
+	if serial, ok := heatnote["serial"].(string); ok && serial != "" {
+		if pipeStr, ok := st.PipeFromSerial(serial); ok {
+			pipe := 0
+			if pipeStr != "" {
+				pipe, _ = strconv.Atoi(pipeStr)
+			}
+			heatnote["pipe"] = pipe
+		}
 	}
 
 	if *noGUI {
