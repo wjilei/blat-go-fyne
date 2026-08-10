@@ -78,16 +78,44 @@ const (
 )
 
 type row struct {
-	title  string
-	name   string
-	result string
-	detail string
+	title     string
+	name      string
+	result    string
+	detail    string
+	startTime time.Time     // 本次 case 最近一次开始运行的时间（OnCaseStart 设置；再次 Start 会覆盖）
+	elapsed   time.Duration // 本次 case 完成时冻结的耗时（OnCaseStop 设置；运行中为 0）
 }
 
 // PlanItem 是计划下拉框里的一个选项：显示名 + 对应的 plan.yml 路径。
 type PlanItem struct {
 	Name string // 下拉框显示名
 	Path string // plan.yml 路径（相对工作目录）
+}
+
+// applyStatusStyle 把 case 状态（ok/fail/running/planned/...）渲染到大写
+// 文字 + 主题色：ok=绿、fail=红、running=黄、planned=灰。颜色走 Fyne
+// Importance（主题感知，浅色/深色模式都适配），不写死 RGB。
+// lb 必须是树行模板里的状态标签（widget.Label）。可在任意线程调用。
+func applyStatusStyle(lb *widget.Label, result string) {
+	var text string
+	var imp widget.Importance
+	switch result {
+	case "ok":
+		text, imp = "OK", widget.SuccessImportance
+	case "fail":
+		text, imp = "FAIL", widget.DangerImportance
+	case "running":
+		text, imp = "RUNNING", widget.WarningImportance
+	case "planned":
+		text, imp = "PLANNED", widget.LowImportance
+	default:
+		text, imp = result, widget.MediumImportance
+	}
+	lb.SetText(text)
+	lb.Importance = imp
+	// Importance 在 SetText 之后赋值不会触发渲染——调 Refresh 让颜色
+	// 立即生效（不必等下一次 ticker 触发的 tree.Refresh）。
+	lb.Refresh()
 }
 
 // readOnlyEntry 已废弃：日志框改用 SelectableRichText（RichText 渲染彩色
@@ -167,6 +195,23 @@ type App struct {
 	// debug 为 true 时（--debug）：跳过日志上传 OSS，日志以原始文本随
 	// 测试记录存库。供 hook_stop 上报逻辑读取。
 	debug bool
+
+	// planStart 是当前正在运行的 plan 的开始时间，由 guiAdapter.OnPlanStart
+	// 注入（取自 reporter 回调的 startTime 参数）。测试过程中 tree 的
+	// plan 节点显示 time.Since(planStart)；未启动时为零值，显示 00:00.000。
+	planStart time.Time
+
+	// planElapsed 冻结 plan 结束时刻的"总耗时"（OnPlanStop 时算）。
+	// 仿 case 的 row.elapsed：计划完成后 ticker 关掉、之后任何路径触发的
+	// update 回调（用户改窗口大小、日志刷新等都可能触发 widget 树重绘）
+	// 都用此冻结值显示，不会让"已完成"的总耗时继续随墙钟走动。
+	// 下一轮 OnPlanStart 会重置为 0。
+	planElapsed time.Duration
+
+	// tickCancel 控制 tree 实时刷新 ticker 的生命周期：OnPlanStart 时
+	// 创建（旧的若有先取消），OnPlanStop 时取消。每 100ms 触发一次
+	// tree.Refresh() 让 MM:SS.mmm 计时器在 UI 上"实时走动"。
+	tickCancel context.CancelFunc
 }
 
 // keyButton 把按钮包装成可聚焦的键盘操作组件：焦点在它上面时（转调
@@ -249,6 +294,10 @@ func New(title string) *App {
 	win.SetOnClosed(func() {
 		a.once.Do(func() { close(a.shutdown) })
 		a.StopRun()
+		// ticker goroutine select 的是 tickCancel（context），不监听
+		// a.shutdown；进程退出 OS 会回收，但显式关掉避免日志/分析
+		// 工具误判 goroutine 泄漏。
+		a.StopTicker()
 	})
 	a.startPump()
 	win.Show()
@@ -420,9 +469,22 @@ func (a *App) build() {
 				ic.SetResource(theme.ListIcon())
 				a.mu.Lock()
 				n := len(a.rows)
+				planStart := a.planStart
+				planElapsed := a.planElapsed
 				a.mu.Unlock()
-				lb.SetText(fmt.Sprintf("测试计划(总数:%d)", n))
+				// 计划节点耗时：
+				//   - planElapsed > 0：plan 已结束（StopTicker 冻结），
+				//     走冻结值——避免"改窗口大小让时间继续走"的视觉问题。
+				//   - planElapsed == 0 且 planStart 非零：运行中，
+				//     用 time.Since(planStart) 让 UI 实时走动。
+				//   - planStart == 零值：未启动，显示 00:00.000。
+				if planElapsed == 0 && !planStart.IsZero() {
+					planElapsed = time.Since(planStart)
+				}
+				lb.SetText(fmt.Sprintf("测试计划(总数:%d)  %s", n, formatDuration(planElapsed)))
+				// 计划节点无"状态"概念，状态标签留空避免误导
 				st.SetText("")
+				st.Importance = widget.MediumImportance
 
 			default:
 				if !strings.HasPrefix(uid, nodeCasePfx) {
@@ -442,8 +504,16 @@ func (a *App) build() {
 				}
 				a.mu.Unlock()
 				ic.SetResource(theme.FileIcon())
-				lb.SetText(fmt.Sprintf("%d. %s", idx, r.title))
-				st.SetText(fmt.Sprintf("[%s]", r.result))
+				// case 耗时：已完成用 r.elapsed（冻结值），运行中用
+				// now - r.startTime（ticker 周期性刷新让它"走动"）。
+				var caseElapsed time.Duration
+				if r.elapsed > 0 {
+					caseElapsed = r.elapsed
+				} else if !r.startTime.IsZero() {
+					caseElapsed = time.Since(r.startTime)
+				}
+				lb.SetText(fmt.Sprintf("%d. %s  %s", idx, r.title, formatDuration(caseElapsed)))
+				applyStatusStyle(st, r.result)
 			}
 		},
 	)
@@ -692,6 +762,7 @@ func (a *App) isDebug() bool {
 // case tree. If a run is in flight it is stopped first.
 func (a *App) loadPlan() {
 	a.stopIfRunning()
+	a.ResetTiming()
 	fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil {
 			a.Error("open plan: " + err.Error())
@@ -792,6 +863,7 @@ func (a *App) planPath(name string) string {
 // env.Vars["HeatNote"]["plan"] 供 case 运行时做判断。
 func (a *App) loadPlanByPath(path string) {
 	a.stopIfRunning()
+	a.ResetTiming()
 	plan, err := config.LoadPlan(path)
 	if err != nil {
 		a.Error(err.Error())
@@ -816,6 +888,7 @@ func (a *App) loadPlanByPath(path string) {
 // clearPlan 清空当前 plan 与用例树（下拉框停在"请选择测试计划"）。
 func (a *App) clearPlan() {
 	a.stopIfRunning()
+	a.ResetTiming()
 	a.mu.Lock()
 	a.plan = nil
 	a.rows = a.rows[:0]
@@ -1223,6 +1296,12 @@ type guiAdapter struct {
 
 func (g *guiAdapter) OnPlanStart(total int, startTime time.Time) {
 	g.total = total
+	// SetPlanStart 内部启动 100ms 周期的 ticker，在 fyne 主线程上周期性
+	// tree.Refresh() 让耗时字段实时走动。OnPlanStart 本身在 runner
+	// goroutine 上被 reporter 回调，需要 fyne.Do 排到主线程执行。
+	fyne.Do(func() {
+		g.gui.SetPlanStart(startTime)
+	})
 }
 
 func (g *guiAdapter) OnCaseStart(seq int, cr report.CaseReport) {
@@ -1263,6 +1342,7 @@ func (g *guiAdapter) OnPlanStop(sum report.Summary) {
 	g.gui.Info(status)
 
 	fyne.Do(func() {
+		g.gui.StopTicker() // 先关 ticker，冻结耗时；再做其他收尾
 		g.gui.prog.SetValue(0)
 		g.gui.tree.Refresh()
 		g.gui.startBtn.SetText("开始测试")
@@ -1342,11 +1422,99 @@ func (a *App) AddRow(title, name string) {
 	fyne.Do(func() { a.tree.Refresh() })
 }
 
+// SetResult 更新 case 状态文字；同时根据状态切换自动维护 case 计时：
+//   - result == "running"：重置 startTime = now, elapsed = 0（新一轮计时开始）
+//   - result ∈ {"ok", "fail"}：冻结 elapsed = now - startTime（完成时刻停表）
+//   - 其他（planned / 异常字符串）：不修改时间字段
+//
+// runner 端调用约定：OnCaseStart 传 "running"，OnCaseStop 传 "ok"/"fail"。
+// 因此同一行只会经历 planned → running → ok|fail 的迁移，时间字段语义自洽。
 func (a *App) SetResult(i int, result, detail string) {
+	now := time.Now()
 	a.mu.Lock()
 	if i >= 0 && i < len(a.rows) {
 		a.rows[i].result = result
 		a.rows[i].detail = detail
+		switch result {
+		case "running":
+			a.rows[i].startTime = now
+			a.rows[i].elapsed = 0
+		case "ok", "fail":
+			if !a.rows[i].startTime.IsZero() {
+				a.rows[i].elapsed = now.Sub(a.rows[i].startTime)
+			}
+		}
+	}
+	a.mu.Unlock()
+	fyne.Do(func() { a.tree.Refresh() })
+}
+
+// SetPlanStart 记录 plan 启动时间并启动一个 100ms 周期的 ticker，在
+// fyne 主线程上周期性 tree.Refresh()，让 plan / case 节点的耗时字段
+// 在 UI 上"实时走动"（毫秒精度）。每轮 plan 启动会替换旧 ticker（旧的
+// 若仍在跑先取消），保证不会双跑。调用方负责在 plan 结束时调 StopTicker。
+// 必须在 fyne 主线程调用（fyne.Do 排到主线程后调）。
+func (a *App) SetPlanStart(t time.Time) {
+	a.mu.Lock()
+	if a.tickCancel != nil {
+		a.tickCancel()
+		a.tickCancel = nil
+	}
+	a.planStart = t
+	a.planElapsed = 0 // 新一轮 plan：清掉上一轮冻结的耗时
+	ctx, cancel := context.WithCancel(context.Background())
+	a.tickCancel = cancel
+	a.mu.Unlock()
+
+	go func() {
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				fyne.Do(func() { a.tree.Refresh() })
+			}
+		}
+	}()
+}
+
+// StopTicker 停止实时刷新 ticker，并把 plan 总耗时冻结到 planElapsed。
+// 关键点：仅靠"关 ticker 让 Refresh 停止"不能冻结显示——窗口缩放、日志
+// 刷新等都会触发 widget 树重绘，进而调到 update 回调。update 回调读
+// time.Since(planStart) 会得到"比 OnPlanStop 时更大"的值（因为 planStart
+// 没清、墙钟还在走），造成"改窗口大小，总时间也增加"的视觉错觉。
+// 解决办法：StopTicker 在锁内把 planElapsed = time.Since(planStart) 写
+// 死，update 渲染时优先用 planElapsed（>0 时不再算 time.Since）。
+// 调用后再做一次 tree.Refresh() 让 UI 立刻显示冻结值。
+// 必须在 fyne 主线程调用。
+func (a *App) StopTicker() {
+	a.mu.Lock()
+	if !a.planStart.IsZero() {
+		a.planElapsed = time.Since(a.planStart)
+	}
+	if a.tickCancel != nil {
+		a.tickCancel()
+		a.tickCancel = nil
+	}
+	a.mu.Unlock()
+	fyne.Do(func() { a.tree.Refresh() })
+}
+
+// ResetTiming 切换/重载/清空 plan 时调用：把 planStart 与 planElapsed
+// 清零、关闭任何仍在跑的 ticker，让"未启动"状态下 plan 节点显示
+// 00:00.000 而不是旧 plan 残留耗时或冻结耗时。
+// 不改 rows[].startTime / elapsed：case 的计时由各 row 自身保留，下一
+// 轮 OnCaseStart 会被 SetResult 覆盖。
+// 必须在 fyne 主线程调用。
+func (a *App) ResetTiming() {
+	a.mu.Lock()
+	a.planStart = time.Time{}
+	a.planElapsed = 0
+	if a.tickCancel != nil {
+		a.tickCancel()
+		a.tickCancel = nil
 	}
 	a.mu.Unlock()
 	fyne.Do(func() { a.tree.Refresh() })
