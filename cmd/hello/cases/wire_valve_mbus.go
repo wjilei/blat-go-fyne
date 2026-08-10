@@ -2,6 +2,7 @@ package cases
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -79,16 +80,10 @@ func (c *WireValveMBusReadMotorCase) Run(ctx context.Context, env *core.Env) err
 
 	// 1.5 弹框让用户观察阀门是否转动（对齐 Perl `ui_show_judgment`）：
 	// 校准命令发出后人工肉眼确认电机已转。选"否"→ 用例直接失败；
-	// 选"是"→ 继续后面的轮询校验。
-	if err := env.UI.Message(ctx, "请观察阀门是否已转动（电机校准命令已发出）", false); err != nil {
+	// 选"是"→ 继续后面的轮询校验。回车 = 「是」（Fyne Confirm 默认
+	// 焦点在「是」按钮上，参见 internal/ui/fyne/app.go yesNoCh 处理）。
+	if err := askValveTurned(ctx, env); err != nil {
 		return err
-	}
-	ans, err := env.UI.Prompt(ctx, "阀门是否转动？（输入'是'继续，输入'否'失败用例）", "是")
-	if err != nil {
-		return err
-	}
-	if ans != "是" {
-		return fmt.Errorf("用户确认阀门未转动")
 	}
 
 	// 2. 轮询读取电机状态，直到匹配期望值或轮询次数耗尽
@@ -134,6 +129,22 @@ func init() {
 	Register("HeatSuite::wire_valve_mbus_read_motor", func() (core.Case, error) {
 		return &WireValveMBusReadMotorCase{}, nil
 	})
+}
+
+// askValveTurned 弹一个「是/否」确认框，让操作员确认电机校准后阀门已转动。
+// 选「是」→ 返回 nil 继续；选「否」→ 返回 error（用例失败）；
+// ctx 取消（Stop 按钮 / 关窗）→ 返回 ctx.Err()。回车默认「是」（参见
+// internal/ui/fyne/app.go yesNoCh 处理，默认焦点在「是」上）。
+func askValveTurned(ctx context.Context, env *core.Env) error {
+	ok, err := env.UI.Confirm(ctx, "请观察阀门是否已转动（电机校准命令已发出）？选「否」将停止并失败")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("用户确认阀门未转动")
+	}
+	env.Log.Info("已确认阀门转动")
+	return nil
 }
 
 // _ensureMBUS 获取/创建 M-Bus 设备并确保已连接（对应 Perl
