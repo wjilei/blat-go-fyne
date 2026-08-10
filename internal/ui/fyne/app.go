@@ -161,8 +161,10 @@ type App struct {
 	prog      *widget.ProgressBar
 	startBtn  *widget.Button
 	configBtn *widget.Button
-	planSel   *widget.Select // 测试计划下拉框
-	planItems []PlanItem     // 下拉框选项（显示名→plan.yml 路径），受 mu 保护
+	planSel     *widget.Select // 测试计划下拉框
+	planItems   []PlanItem     // 下拉框选项（显示名→plan.yml 路径），受 mu 保护
+	serialLabel *widget.Label  // 工具栏右侧的"当前测试序列号"标签
+	resultLabel *widget.Label  // 工具栏最右侧的"最终测试结果"标签（粗体、标题字号）
 
 	// varsFile 是配置（MBUS 串口等）持久化的目标文件路径；相对工作目录。
 	// 启动时 main 用 config.LoadEnv(varsFile) 读入 env.Vars，配置弹框
@@ -526,6 +528,8 @@ func (a *App) build() {
 			a.StopRun()
 		}
 	})
+	// 默认绿色：与"未在测试"的静止态匹配；测试中切到 Danger（红）。
+	a.startBtn.Importance = widget.SuccessImportance
 
 	a.configBtn = widget.NewButtonWithIcon("配置", theme.SettingsIcon(), func() {
 		a.promptConfig()
@@ -538,7 +542,26 @@ func (a *App) build() {
 	})
 	a.planSel.PlaceHolder = planPlaceholder
 
-	tb := newBottomBorder(container.NewHBox(a.startBtn, a.configBtn, a.planSel), theme.ColorNameInputBorder, 1)
+	// 工具栏右侧"当前测试序列号"标签：未启动时显示占位符，由
+	// syncSerialLabel 在序列号写入 / 计划启停时刷新。
+	// 字号加大+加粗，与结果标签视觉权重一致——便于操作员一眼锁定"测的哪台"。
+	a.serialLabel = widget.NewLabel("序列号: -")
+	a.serialLabel.Importance = widget.MediumImportance
+	a.serialLabel.SizeName = theme.SizeNameHeadingText
+	a.serialLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	// 工具栏最右侧"最终测试结果"标签：粗体 + 标题字号。测试中 Hide，
+	// 跑完（OnPlanStop）Show 并由 planResultLabel 决定填"成功"/"失败"/"已取消"。
+	a.resultLabel = widget.NewLabel("")
+	a.resultLabel.TextStyle = fyne.TextStyle{Bold: true}
+	a.resultLabel.SizeName = theme.SizeNameHeadingText
+	a.resultLabel.Hide() // 默认隐藏，跑完测试再显示
+
+	// 工具栏：左侧操作（开始/结束、配置、计划下拉） + 弹性间隔 + 右侧
+	// 序列号 + 最终结果。结果标签紧跟序列号，便于操作员一眼确认本轮结论。
+	tb := newBottomBorder(container.NewHBox(
+		a.startBtn, a.configBtn, a.planSel, layout.NewSpacer(), a.serialLabel, a.resultLabel,
+	), theme.ColorNameInputBorder, 1)
 
 	statusBar := newTopBorder(container.NewHBox(a.status, layout.NewSpacer(), a.prog), theme.ColorNameInputBorder, 1)
 
@@ -898,6 +921,25 @@ func (a *App) clearPlan() {
 	a.SetStatus("未选择测试计划")
 }
 
+// planResultLabel 根据 plan 跑完后的 Summary 与是否被用户取消，决定
+// 工具栏"测试结果"标签的文本与是否算成功。供 OnPlanStop 收尾时调用，
+// 抽出为纯函数以便单元测试，避免 UI 集成测试。
+//
+// 规则（按优先级）：
+//  1. cancelled=true → "已取消"，不视作成功
+//  2. sum.FailNum > 0 → "失败"，不视作成功
+//  3. 其余（含 TotalNum=0 无失败）→ "成功"
+func planResultLabel(sum report.Summary, cancelled bool) (text string, ok bool) {
+	switch {
+	case cancelled:
+		return "已取消", false
+	case sum.FailNum > 0:
+		return "失败", false
+	default:
+		return "成功", true
+	}
+}
+
 // setPlanVar 把当前计划文件路径写入 env.Vars["HeatNote"]["plan"]；
 // path 为空时删除该键。env 尚未 Attach 时直接返回。
 func (a *App) setPlanVar(path string) {
@@ -918,6 +960,32 @@ func (a *App) setPlanVar(path string) {
 	a.env.Vars["HeatNote"] = hn
 }
 
+// syncSerialLabel 把工具栏的"当前测试序列号"标签同步到 env.Vars["HeatNote"]
+// ["serial"] 的最新值。empty=true 时强制清空（不论 env 里有没有值），
+// 用于测试结束后回归占位符"序列号: -"。env 尚未 Attach 时同样显示占位符。
+// 读 env 用 a.mu 保护，setText 走 fyne.Do 排到主线程，调用方无线程要求。
+func (a *App) syncSerialLabel(empty bool) {
+	text := "序列号: -"
+	if !empty {
+		a.mu.Lock()
+		var sn string
+		if a.env != nil {
+			if hn, ok := a.env.Vars["HeatNote"].(map[string]any); ok {
+				sn, _ = hn["serial"].(string)
+			}
+		}
+		a.mu.Unlock()
+		if sn != "" {
+			text = "序列号: " + sn
+		}
+	}
+	fyne.Do(func() {
+		if a.serialLabel != nil {
+			a.serialLabel.SetText(text)
+		}
+	})
+}
+
 // setSerialVar 把启动弹框输入的序列号写入 env.Vars["HeatNote"]["serial"]，
 // 并从序列号解出 ST 值、按映射表查出管径写入 HeatNote["pipe"]（无管径族
 // 写 0），供 case 运行时读取（与蓝牙读回的 DN 比较）。ST 不在映射表时
@@ -935,8 +1003,8 @@ func (a *App) setSerialVar(serial string) error {
 		pipe, _ = strconv.Atoi(pipeStr)
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.env == nil {
+		a.mu.Unlock()
 		return nil
 	}
 	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
@@ -946,6 +1014,11 @@ func (a *App) setSerialVar(serial string) error {
 	hn["serial"] = serial
 	hn["pipe"] = pipe
 	a.env.Vars["HeatNote"] = hn
+	// 显式 unlock（不 defer）——syncSerialLabel 内部还要 a.mu.Lock()，
+	// Go sync.Mutex 不可重入，锁内再 Lock 会永久自死锁（用户回车后 UI 卡死）。
+	a.mu.Unlock()
+	// 工具栏序列号标签即时反映刚输入的序列号
+	a.syncSerialLabel(false)
 	return nil
 }
 
@@ -1244,6 +1317,11 @@ func (a *App) startRun() {
 	}
 	a.startBtn.SetIcon(theme.MediaStopIcon())
 	a.startBtn.SetText("结束测试")
+	a.startBtn.Importance = widget.DangerImportance // 测试中保持红色
+	a.startBtn.Refresh()                            // Importance 字段是结构体，字段改动需手动 Refresh 才能换色
+	a.configBtn.Disable()                           // 测中不允许改配置
+	a.planSel.Disable()                             // 测中不允许换计划
+	a.resultLabel.Hide()                            // 测试中隐藏上一轮结论
 	ctx, _ := a.StartRun()
 	a.SetStatus("running...")
 	go func() {
@@ -1301,6 +1379,8 @@ func (g *guiAdapter) OnPlanStart(total int, startTime time.Time) {
 	// goroutine 上被 reporter 回调，需要 fyne.Do 排到主线程执行。
 	fyne.Do(func() {
 		g.gui.SetPlanStart(startTime)
+		// 计划开始时再同步一次序列号标签（防御 setSerialVar 之后的并发改写）
+		g.gui.syncSerialLabel(false)
 	})
 }
 
@@ -1347,8 +1427,25 @@ func (g *guiAdapter) OnPlanStop(sum report.Summary) {
 		g.gui.tree.Refresh()
 		g.gui.startBtn.SetText("开始测试")
 		g.gui.startBtn.SetIcon(theme.MediaPlayIcon())
+		g.gui.startBtn.Importance = widget.SuccessImportance // 静止态切回绿色
+		g.gui.startBtn.Refresh()                             // Importance 字段改动需手动 Refresh
 		g.gui.startBtn.Enable()
+		g.gui.configBtn.Enable() // 测试结束恢复配置按钮可点
+		g.gui.planSel.Enable()   // 测试结束恢复下拉框可点
 		g.gui.SetStatus(status)
+		// 工具栏"最终测试结果"标签：成功绿、失败/取消红，由 planResultLabel 决定；
+		// Label 的 Importance 字段映射到 theme.ColorNameSuccess/Error。
+		resultText, ok := planResultLabel(sum, g.cancelled)
+		g.gui.resultLabel.SetText("  " + resultText) // 前导空格与序列号标签隔开
+		if ok {
+			g.gui.resultLabel.Importance = widget.SuccessImportance
+		} else {
+			g.gui.resultLabel.Importance = widget.DangerImportance
+		}
+		g.gui.resultLabel.Refresh() // Importance 字段是结构体，字段改动需手动 Refresh
+		g.gui.resultLabel.Show()    // 跑完测试显示结果
+		// 工具栏序列号标签保留显示，不清空——便于操作员在多轮测试间
+		// 确认"上一台测的是哪台"，下一次开始测试会自然覆盖。
 	})
 }
 
