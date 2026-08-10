@@ -149,3 +149,52 @@ func (c *Console) Message(ctx context.Context, msg string, danger bool) error {
 	}
 	return c.WaitContinue(ctx, msg)
 }
+
+// Confirm 在 stdin 上读取一行 y/n 解析为 bool。空行视作"否"。
+// 同时支持中文"是/否"。ctx 取消时返回 ctx.Err()。
+func (c *Console) Confirm(ctx context.Context, msg string) (bool, error) {
+	fmt.Fprintf(c.w, "%s [y/N]: ", msg)
+	ch := make(chan struct {
+		val bool
+		err error
+	}, 1)
+	go func() {
+		line, err := c.r.ReadString('\n')
+		if err != nil {
+			ch <- struct {
+				val bool
+				err error
+			}{err: err}
+			return
+		}
+		ch <- struct {
+			val bool
+			err error
+		}{val: _parseYesNo(strings.TrimSpace(line))}
+	}()
+	select {
+	case r := <-ch:
+		return r.val, r.err
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// _parseYesNo 解析 y/n/yes/no（大小写不敏感），空字符串返回 false。
+// 中文"是/否"也接受：含"否"字直接判负，避免"否是"这种输入误判。
+func _parseYesNo(s string) bool {
+	low := strings.ToLower(s)
+	if low == "" {
+		return false
+	}
+	if strings.Contains(s, "否") {
+		return false
+	}
+	if strings.Contains(s, "是") {
+		return true
+	}
+	if low == "y" || low == "yes" {
+		return true
+	}
+	return false
+}

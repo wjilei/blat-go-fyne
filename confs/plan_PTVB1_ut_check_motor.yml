@@ -1,0 +1,9 @@
+# M-Bus 电机启动状态检查（Heat 套件）
+# 通过 M-Bus 读取电机启动状态，与期望值比对；未达到期望则按轮询间隔重试
+# （轮询次数默认 180、间隔默认 1s），直到轮询次数耗尽判失败。
+- name: HeatSuite::wire_valve_mbus_read_motor
+  title: M-Bus 电机启动状态检查
+  case_seq: 1
+  counts: 1
+  desc: 通过 M-Bus 读取电机启动状态，与期望值比对
+  key_state: "09"

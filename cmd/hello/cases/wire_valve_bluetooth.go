@@ -201,7 +201,9 @@ func (c *WireValveBluetoothResetValveCase) Run(ctx context.Context, env *core.En
 
 // WireValveObserveValveCase 提示操作员观察阀门状态。
 // 用于重置阀门（bluetooth_reset_valve）之后人工确认执行器是否动作：
-// 通过 UI 弹出提示信息，等待操作员观察后确认继续（GUI 弹框 / Console 回车）。
+// 通过 UI 弹出"是/否"选择框，让操作员确认阀门已转动。选"否"→
+// 直接返回错误，用例失败；选"是"→ 继续后续步骤。ctx-aware
+// （Stop 按钮 / 关窗时返回 ctx.Err()）。
 type WireValveObserveValveCase struct{}
 
 func (c *WireValveObserveValveCase) Name() string {
@@ -209,9 +211,12 @@ func (c *WireValveObserveValveCase) Name() string {
 }
 
 func (c *WireValveObserveValveCase) Run(ctx context.Context, env *core.Env) error {
-	// 触发 UI 提示；ctx-aware（Stop/关窗时返回 ctx.Err()）
-	if err := env.UI.Message(ctx, "请观察阀门是否转动，确认后继续", true); err != nil {
+	ok, err := env.UI.Confirm(ctx, "请观察阀门是否已转动？选择「否」将停止并失败")
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return errors.New("用户确认阀门未转动")
 	}
 	env.Log.Info("已确认观察阀门")
 	return nil

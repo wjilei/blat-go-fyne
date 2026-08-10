@@ -48,8 +48,7 @@ import (
 var builtinPlans = []fyneui.PlanItem{
 	{Name: "平衡阀初始化电机", Path: "confs/plan_PSAV_ut_resetvalve.yml"},
 	{Name: "平衡阀检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
-	{Name: "流量计检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
-	{Name: "户控阀检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
+	{Name: "户控阀检查电机状态", Path: "confs/plan_PTVB1_ut_check_motor.yml"},
 }
 
 // planInList 报告 path 是否已存在于 items（按规范化路径比较）。

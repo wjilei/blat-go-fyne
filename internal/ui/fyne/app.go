@@ -109,6 +109,12 @@ type confirmReq struct {
 	reply chan struct{}
 }
 
+// yesNoReq 是 Confirm 通道的请求：是/否双按钮弹框，reply 携带用户选择。
+type yesNoReq struct {
+	msg   string
+	reply chan bool
+}
+
 type messageReq struct {
 	msg    string
 	danger bool
@@ -145,6 +151,7 @@ type App struct {
 
 	promptCh  chan promptReq
 	confirmCh chan confirmReq
+	yesNoCh   chan yesNoReq
 	messageCh chan messageReq
 	shutdown  chan struct{}
 	once      sync.Once
@@ -234,6 +241,7 @@ func New(title string) *App {
 		varsFile:  "confs/env.yml",
 		promptCh:  make(chan promptReq, 8),
 		confirmCh: make(chan confirmReq, 8),
+		yesNoCh:   make(chan yesNoReq, 8),
 		messageCh: make(chan messageReq, 8),
 		shutdown:  make(chan struct{}),
 	}
@@ -536,6 +544,37 @@ func (a *App) startPump() {
 					popup = widget.NewModalPopUp(padded, a.win.Canvas())
 					popup.Show()
 					fyne.Do(func() { a.win.Canvas().Focus(okKB) })
+				})
+			case req := <-a.yesNoCh:
+				fyne.Do(func() {
+					// 是/否双按钮弹框：选"是"→reply true；选"否"或
+					// 关窗→reply false。两个按钮都用 keyButton 包装以支持
+					// 回车触发；默认焦点放在"是"上（用户多选确认）。
+					var popup *widget.PopUp
+					yesBtn := widget.NewButton("是", func() {
+						popup.Hide()
+						select {
+						case req.reply <- true:
+						case <-a.shutdown:
+						}
+					})
+					noBtn := widget.NewButton("否", func() {
+						popup.Hide()
+						select {
+						case req.reply <- false:
+						case <-a.shutdown:
+						}
+					})
+					yesKB := newKeyButton(yesBtn)
+					noKB := newKeyButton(noBtn)
+					title := widget.NewLabelWithStyle("请选择", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+					msgLabel := widget.NewLabel(req.msg)
+					buttonRow := container.NewHBox(layout.NewSpacer(), noKB, yesKB)
+					content := container.NewVBox(title, widget.NewSeparator(), msgLabel, buttonRow)
+					padded := container.New(layout.NewPaddedLayout(), content)
+					popup = widget.NewModalPopUp(padded, a.win.Canvas())
+					popup.Show()
+					fyne.Do(func() { a.win.Canvas().Focus(yesKB) })
 				})
 			case req := <-a.messageCh:
 				fyne.Do(func() {
@@ -1520,5 +1559,28 @@ func (a *App) Message(ctx context.Context, msg string, danger bool) error {
 		return fmt.Errorf("ui shutdown")
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// Confirm blocks until the user picks 是/否、ctx done 或窗口关闭。
+// 返回 (true, nil) 表示用户选"是"，(false, nil) 表示选"否"。
+// 关窗走 a.shutdown 通道返回 error（"ui shutdown"），便于调用方
+// 区分主动取消与正常"否"。
+func (a *App) Confirm(ctx context.Context, msg string) (bool, error) {
+	req := yesNoReq{msg: msg, reply: make(chan bool, 1)}
+	select {
+	case a.yesNoCh <- req:
+	case <-a.shutdown:
+		return false, fmt.Errorf("ui shutdown")
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	select {
+	case ok := <-req.reply:
+		return ok, nil
+	case <-a.shutdown:
+		return false, fmt.Errorf("ui shutdown")
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
 }

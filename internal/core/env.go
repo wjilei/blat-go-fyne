@@ -25,10 +25,10 @@ type Logger interface {
 // UI is the minimal UI hook interface. Concrete implementations may be a
 // console UI, a Tk UI, or a stub for tests.
 //
-// Prompt, WaitContinue and Message take a context so the runner can cancel
-// a blocking dialog (e.g. when the user presses the toolbar Stop button or
-// the window is closed). Implementations MUST honor the context and
-// return ctx.Err() when it is done.
+// Prompt, WaitContinue, Message and Confirm take a context so the runner
+// can cancel a blocking dialog (e.g. when the user presses the toolbar Stop
+// button or the window is closed). Implementations MUST honor the context
+// and return ctx.Err() when it is done.
 type UI interface {
 	Info(string)
 	Prompt(ctx context.Context, label, def string) (string, error)
@@ -36,6 +36,10 @@ type UI interface {
 	// Message 弹出一个只有"确定"按钮的消息框（无取消）。danger 为 true 时
 	// 消息文字以错误色（红色）渲染，用于醒目提醒。返回 nil 表示用户已确认。
 	Message(ctx context.Context, msg string, danger bool) error
+	// Confirm 弹出一个"是/否"选择框，返回用户的选择。
+	// true=是（继续），false=否（用例应主动失败）。GUI 实现通常对应
+	// dialog.NewConfirm；Console 实现通过 stdin 输入 y/n 解析。
+	Confirm(ctx context.Context, msg string) (bool, error)
 }
 
 // Env is the shared context passed through every Case at run time. It carries
