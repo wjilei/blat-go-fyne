@@ -8,7 +8,9 @@ package uploader
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,14 +29,16 @@ import (
 // 属逻辑常量，保留在代码里。
 const devTypeHeat = "2"
 
-// Config 是上报所需的凭据配置，由 config.LoadUploader 从 YAML 加载后经 Init 注入。
+// Config 是上报所需的非敏感配置，由 config.LoadUploader 从 YAML 加载后经 Init 注入。
+// OSS 不再含长效 AccessKey/SecretKey——每次上传通过 BlatConfig.BaseURL + Token
+// 从 BLAT 后台 GET /v1/ststoken 拉取 STS 临时凭证（见 sts.go）。
 type Config struct {
 	OSS  OSSConfig
 	Blat BlatConfig
 }
 
 type OSSConfig struct {
-	AccessID, SecretKey, Host, LogBucket string
+	Endpoint, LogBucket string
 }
 
 type BlatConfig struct {
@@ -71,21 +75,21 @@ func LzmaCompress(data []byte) ([]byte, error) {
 // UploadLogOSS 把压缩后的日志上传到阿里云 OSS，模拟 BLAT Utils.pm 的 save_log_to_oss。
 // 最多重试 6 次；每次失败后若距上次失败不足 3 秒，则 sleep 补足到 3 秒再重试，
 // 避免触发 OSS 限流造成连续快速失败。
-func UploadLogOSS(ossPath string, content []byte) error {
+//
+// 凭据：每次循环都通过 tokenSource.Token(ctx) 拉 STS 临时凭证，失败重试时
+// 也重新拉一次（sts.go 内部缓存会在过期前 60s 续期）。
+func UploadLogOSS(ctx context.Context, ossPath string, content []byte) error {
 	const maxRetry = 6
 	const retryInterval = 3 * time.Second
+
+	if cfg.OSS.Endpoint == "" || cfg.OSS.LogBucket == "" {
+		return errors.New("uploader: OSS.Endpoint / OSS.LogBucket 未配置，无法上传")
+	}
 
 	var lastErr error
 	lastFail := time.Time{}
 	for attempt := 1; attempt <= maxRetry; attempt++ {
-		client, err := oss.New("https://"+cfg.OSS.Host, cfg.OSS.AccessID, cfg.OSS.SecretKey)
-		if err == nil {
-			var bucket *oss.Bucket
-			bucket, err = client.Bucket(cfg.OSS.LogBucket)
-			if err == nil {
-				err = bucket.PutObject(ossPath, bytes.NewReader(content))
-			}
-		}
+		err := uploadOnceWithSTS(ctx, ossPath, content)
 		if err == nil {
 			return nil
 		}
@@ -99,6 +103,30 @@ func UploadLogOSS(ossPath string, content []byte) error {
 		lastFail = time.Now()
 	}
 	return lastErr
+}
+
+// uploadOnceWithSTS 拉一次 STS，建 OSS client，调 PutObject。
+// 失败时一并把 token 标记为"已耗尽"——但当前实现里 sts.blatSTSSource 不会主动
+// 失效缓存（避免一次网络抖动就强制所有人重拉），由下次 Token() 自然续期。
+func uploadOnceWithSTS(ctx context.Context, ossPath string, content []byte) error {
+	tok, err := defaultTokenSource.Token(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 STS 失败: %w", err)
+	}
+	client, err := oss.New(
+		cfg.OSS.Endpoint,
+		tok.AccessKeyID,
+		tok.AccessKeySecret,
+		oss.SecurityToken(tok.SecurityToken),
+	)
+	if err != nil {
+		return err
+	}
+	bucket, err := client.Bucket(cfg.OSS.LogBucket)
+	if err != nil {
+		return err
+	}
+	return bucket.PutObject(ossPath, bytes.NewReader(content))
 }
 
 // fatalHTTPError 表示服务器返回 400/401/500，按 BLAT do_request 的规则应
@@ -374,7 +402,7 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 	compressed, err := LzmaCompress([]byte(log))
 	if err != nil {
 		h.env.Log.Error("日志压缩失败: " + err.Error())
-	} else if err := UploadLogOSS(ossPath, compressed); err != nil {
+	} else if err := UploadLogOSS(context.Background(), ossPath, compressed); err != nil {
 		h.env.Log.Error("日志上传OSS失败: " + err.Error())
 	} else {
 		h.env.Log.Info("日志已上传OSS: " + ossPath)

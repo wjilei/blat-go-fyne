@@ -80,7 +80,7 @@ func main() {
 		os.Exit(2)
 	}
 	uploader.Init(uploader.Config{
-		OSS:  uploader.OSSConfig{AccessID: ucfg.OSS.AccessID, SecretKey: ucfg.OSS.SecretKey, Host: ucfg.OSS.Host, LogBucket: ucfg.OSS.LogBucket},
+		OSS:  uploader.OSSConfig{Endpoint: ucfg.OSS.Endpoint, LogBucket: ucfg.OSS.LogBucket},
 		Blat: uploader.BlatConfig{BaseURL: ucfg.Blat.BaseURL, Token: ucfg.Blat.Token},
 	})
 

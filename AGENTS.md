@@ -122,3 +122,17 @@ go run ./cmd/blat --debug                          # 上报只打印不触网
 - **蓝牙连接复用**：所有蓝牙用例统一走 `_ensureBluetooth`（cases 包）：优先取 `HeatNote["bluetooth"]`；否则仅当 `Devs["bluetooth"]` 实例模式与 `bt_mock` 一致才兜底复用，再否则按 `bt_mock` 新建 mock/real 并写回。**不要**无条件 fallback 到 `env.Devs["bluetooth"]`——main 默认注入 real，会让 `-mock-bt=true` 拿不到 mock。
 - **新加用例**：在 `cmd/blat/cases/` 下新建文件，实现 `core.Case`（可加 `Configure`），`init()` 里 `Register("<Suite>::<方法名>", ...)`，然后在 plan YAML 里按名字引用。
 - **新加计划**：plan 文件放 `confs/`，按 `plan_<设备类型>_<模式>.yml` 命名；GUI 下拉框选项在 `main.go` 的 `builtinPlans` 里追加。
+
+
+## WSL 路径
+
+blatServer 源码在 WSL Ubuntu 的 `~/workspace/blatServer`（Windows 侧勿用 `\\wsl$\Ubuntu\home\24244\...` 跨 WSL 用户路径访问；要读该目录统一走 `wsl -d Ubuntu -- bash -lc 'cd ~/workspace/blatServer && ...'`）。
+
+## BLAT 后台 STS 凭证接口
+
+`GET /v1/ststoken`（`api/v1/auth_handler.go` 的 `GetStsToken`，路由在 `api/v1/routes.go:195`）：
+
+- 用 `global.APP_LOG_OSS_ACCESS_KEY / SECRET_KEY` + `OSS_ROLE_ARN` + `OSS_SESSION_NAME` 调 `sts.AssumeRole(900)`（900s 过期）。
+- 路由 `GlobalRead: true`，无身份校验；返回 `{accessKeyId, accessKeySecret, securityToken, expiration}`。
+- 角色 `aliyunosstokengeneratorrole` 默认覆盖 `blat-app-log` bucket（`api/v1/oss_test.go` 已验证）。
+- 客户端应在过期前（提前 ~60s）续期，重试首次失败时也重新拉一次。

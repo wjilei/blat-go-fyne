@@ -7,15 +7,13 @@ import (
 )
 
 // TestLoadUploader_OK 验证 LoadUploader 能正确解析合法的 uploader YAML，
-// 各字段逐一断言。测试用虚构凭据，避免把真实凭据写进 .go 文件。
+// 各字段逐一断言。测试用虚构值，避免把真实凭据写进 .go 文件。
 func TestLoadUploader_OK(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "uploader.yml")
 	content := `oss:
-    access_id: "fake-access-id"
-    secret_key: "fake-secret-key"
-    host: "oss-cn-hangzhou.example.com"
-    log_bucket: "example-app-log"
+    endpoint: "https://oss-cn-hangzhou.example.com"
+    log_bucket: "blat-app-log"
 blat:
     base_url: "https://blat.example.com"
     token: "fake-token-value"
@@ -28,17 +26,11 @@ blat:
 	if err != nil {
 		t.Fatalf("LoadUploader() error = %v", err)
 	}
-	if cfg.OSS.AccessID != "fake-access-id" {
-		t.Errorf("OSS.AccessID = %q, want %q", cfg.OSS.AccessID, "fake-access-id")
+	if cfg.OSS.Endpoint != "https://oss-cn-hangzhou.example.com" {
+		t.Errorf("OSS.Endpoint = %q, want %q", cfg.OSS.Endpoint, "https://oss-cn-hangzhou.example.com")
 	}
-	if cfg.OSS.SecretKey != "fake-secret-key" {
-		t.Errorf("OSS.SecretKey = %q, want %q", cfg.OSS.SecretKey, "fake-secret-key")
-	}
-	if cfg.OSS.Host != "oss-cn-hangzhou.example.com" {
-		t.Errorf("OSS.Host = %q, want %q", cfg.OSS.Host, "oss-cn-hangzhou.example.com")
-	}
-	if cfg.OSS.LogBucket != "example-app-log" {
-		t.Errorf("OSS.LogBucket = %q, want %q", cfg.OSS.LogBucket, "example-app-log")
+	if cfg.OSS.LogBucket != "blat-app-log" {
+		t.Errorf("OSS.LogBucket = %q, want %q", cfg.OSS.LogBucket, "blat-app-log")
 	}
 	if cfg.Blat.BaseURL != "https://blat.example.com" {
 		t.Errorf("Blat.BaseURL = %q, want %q", cfg.Blat.BaseURL, "https://blat.example.com")
