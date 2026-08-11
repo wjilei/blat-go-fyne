@@ -3,7 +3,9 @@
 // It opens a Fyne window, loads plan.yml, and runs the plan (all cases
 // auto-registered by the cases package). Pass -no-gui to run with the
 // console UI instead (useful in CI / headless boxes). Pass --env to load
-// a YAML env file into Env.Vars (e.g. confs/env.yml for the Heat demo).
+// a YAML env file into Env.Vars; the default path is ~/.blat/env.yml
+// (same directory as uploader.uuid.txt) — installation under %PROGRAMFILES%
+// is read-only, so per-user config must live in the user's home.
 //
 // 工具栏"配置"按钮后有一个测试计划下拉框（选项见 builtinPlans），选中的
 // plan.yml 路径会写入 env.Vars["HeatNote"]["plan"] 供 case 运行时判断。
@@ -64,7 +66,7 @@ func planInList(items []fyneui.PlanItem, path string) bool {
 
 func main() {
 	planPath := flag.String("plan", "", "path to plan YAML; 留空则不预选计划（下拉框停在\"请选择测试计划\"），-no-gui 模式必须提供")
-	envPath := flag.String("env", "confs/env.yml", "path to vars YAML (e.g. MBUS port); 缺文件忽略")
+	envPath := flag.String("env", config.DefaultEnvPath(), "path to vars YAML (e.g. MBUS port); 缺文件忽略；默认 ~/.blat/env.yml")
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
 	mockBT := flag.Bool("mock-bt", false, "use mock bluetooth (no hardware); 默认 false 走真实 BLE")
 	debug := flag.Bool("debug", false, "debug 模式：不实际上传 OSS / 保存数据库，把要上报的数据打印到日志")
@@ -121,6 +123,15 @@ func main() {
 
 	vars := map[string]any{}
 	if *envPath != "" {
+		// 启动时确保 ~/.blat/ 存在——env.yml 默认落到这里，GUI 保存时
+		// SaveEnv 也会 MkdirAll，但提前建好可让 LoadEnv 在文件缺失时也
+		// 不报"父目录不存在"。非默认路径同样兜底。
+		if dir := filepath.Dir(*envPath); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				fmt.Fprintln(os.Stderr, "mkdir env dir:", err)
+				os.Exit(2)
+			}
+		}
 		// 文件不存在视为"未配置"，vars 留空；其它错误才退出。
 		if _, statErr := os.Stat(*envPath); statErr == nil {
 			v, err := config.LoadEnv(*envPath)
@@ -173,7 +184,7 @@ func main() {
 		}
 		os.Exit(runConsole(plan, vars, *debug))
 	}
-	os.Exit(runGUI(items, selectPath, vars, *debug))
+	os.Exit(runGUI(items, selectPath, vars, *debug, *envPath))
 }
 
 func runConsole(plan *config.Plan, vars map[string]any, debug bool) int {
@@ -221,7 +232,7 @@ func disconnectBluetooth(env *core.Env) {
 	}
 }
 
-func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, debug bool) int {
+func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, debug bool, varsFile string) int {
 	gui := fyneui.New("BLAT测试程序")
 
 	env := &core.Env{
@@ -242,6 +253,8 @@ func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, deb
 	gui.SyncWorkstationLabel()
 	// --debug：跳过日志上传 OSS，日志以原始文本随测试记录存库。
 	gui.SetDebug(debug)
+	// 用户配置（MBUS 串口等）落盘路径。默认 ~/.blat/env.yml，可由 --env 覆盖。
+	gui.SetVarsFile(varsFile)
 	gui.SetPlanList(items, selectPath)
 
 	// Block on the Fyne event loop. Closing the window cancels any

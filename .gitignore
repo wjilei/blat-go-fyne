@@ -5,3 +5,5 @@ bin/
 report*.yml
 confs/uploader.yml
 .opencode
+dist
+test.log

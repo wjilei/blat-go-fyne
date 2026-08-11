@@ -6,6 +6,27 @@ import (
 	"testing"
 )
 
+func TestDefaultEnvPath(t *testing.T) {
+	// HOME / USERPROFILE 指向临时目录，断言路径形如 <home>/.blat/env.yml。
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	got := DefaultEnvPath()
+	want := filepath.Join(dir, ".blat", "env.yml")
+	if got != want {
+		t.Fatalf("DefaultEnvPath() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultEnvPath_FallbackOnEmptyHome(t *testing.T) {
+	// HOME / USERPROFILE 为空时退化为裸文件名 env.yml。
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	if got := DefaultEnvPath(); got != "env.yml" {
+		t.Fatalf("DefaultEnvPath() with empty home = %q, want %q", got, "env.yml")
+	}
+}
+
 func TestSaveEnv_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vars.yml")

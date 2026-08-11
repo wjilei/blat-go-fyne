@@ -168,9 +168,9 @@ type App struct {
 	workstationLabel *widget.Label  // 工具栏右侧的"当前工位"标签（启动期从 env.Vars 一次性拉取）
 	resultLabel      *widget.Label  // 工具栏最右侧的"最终测试结果"标签（粗体、标题字号）
 
-	// varsFile 是配置（MBUS 串口等）持久化的目标文件路径；相对工作目录。
-	// 启动时 main 用 config.LoadEnv(varsFile) 读入 env.Vars，配置弹框
-	// 写回同一文件，保证"下次启动自动加载"。
+	// varsFile 是配置（MBUS 串口等）持久化的目标文件路径。由 main 在启动时
+	// 通过 SetVarsFile 注入，默认值是 ~/.blat/env.yml（config.DefaultEnvPath），
+	// 放在用户家目录下以避开 %PROGRAMFILES% 的只读权限——安装目录写不进去。
 	varsFile string
 
 	mu         sync.Mutex
@@ -287,7 +287,7 @@ func New(title string) *App {
 		logf:      logf,
 		logOff:    logOff,
 		logGen:    logGen,
-		varsFile:  "confs/env.yml",
+		varsFile:  "", // 由 main 在启动时通过 SetVarsFile 注入，路径默认 ~/.blat/env.yml
 		promptCh:  make(chan promptReq, 8),
 		confirmCh: make(chan confirmReq, 8),
 		yesNoCh:   make(chan yesNoReq, 8),
@@ -785,6 +785,15 @@ func (a *App) SetDebug(debug bool) {
 	a.mu.Unlock()
 }
 
+// SetVarsFile 设置用户配置（MBUS 串口等）落盘路径。供 main 在启动时调用；
+// 不传则保持 New 时的初始值（空串，applyMBUSPort 拒绝写入并提示）。
+// 默认 ~/.blat/env.yml（config.DefaultEnvPath），由 main 从 --env 取值注入。
+func (a *App) SetVarsFile(path string) {
+	a.mu.Lock()
+	a.varsFile = path
+	a.mu.Unlock()
+}
+
 // isDebug 返回当前是否处于 --debug 模式（供 goroutine 中安全读取）。
 func (a *App) isDebug() bool {
 	a.mu.Lock()
@@ -1196,13 +1205,19 @@ func (a *App) promptConfig() {
 	}, a.win).Show()
 }
 
-// applyMBUSPort 把新串口写进 env.Vars 并落盘到 confs/env.yml。env 为 nil
-// （未 Attach）时直接返回——这种情况在产品流程里不会出现，防御性兜底。
+// applyMBUSPort 把新串口写进 env.Vars 并落盘到 ~/.blat/env.yml。
+// env 为 nil（未 Attach）或 varsFile 为空（main 未注入）时直接返回——
+// 产品流程里都不会发生，防御性兜底。
 func (a *App) applyMBUSPort(port string) {
 	a.mu.Lock()
 	if a.env == nil {
 		a.mu.Unlock()
 		a.Warn("env 尚未初始化，无法保存配置")
+		return
+	}
+	if a.varsFile == "" {
+		a.mu.Unlock()
+		a.Warn("varsFile 尚未初始化（main 未注入），无法保存配置")
 		return
 	}
 	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
@@ -1219,14 +1234,21 @@ func (a *App) applyMBUSPort(port string) {
 	path := a.varsFile
 	a.mu.Unlock()
 
-	// 落盘前剔除不可序列化的运行时对象（如 Vars.HeatNote["bluetooth"] 里的
-	// *bluetooth.Device），否则 yaml.Marshal 会失败。HeatNote.plan 是当前
-	// 下拉框选中的计划路径，属临时运行状态，不随配置落盘持久化。
-	clean := config.CleanVars(a.env.Vars, "bluetooth")
-	if hn, ok := clean["HeatNote"].(map[string]any); ok {
-		delete(hn, "plan")
+	// 落盘只写用户配置（MBUS 串口）。env.yml schema 由我们控制——
+	// 不混入 TEST_WORKSTATION / HeatNote.bt_mock / HeatNote.plan / HeatNote.bluetooth
+	// 等运行时字段。这样 env.yml 始终保持最小可读 schema（用户给的样例：
+	// HeatNote.mbus.{baudRate,parity,port}），落在 ~/.blat/env.yml 即可——
+	// 即便程序安装到 %PROGRAMFILES%（只读目录）也能正常保存。
+	minimal := map[string]any{
+		"HeatNote": map[string]any{
+			"mbus": map[string]any{
+				"baudRate": config.DefaultMBUSBaudRate,
+				"parity":   config.DefaultMBUSParity,
+				"port":     port,
+			},
+		},
 	}
-	if err := config.SaveEnv(path, clean); err != nil {
+	if err := config.SaveEnv(path, minimal); err != nil {
 		dialog.ShowError(fmt.Errorf("保存 %s 失败: %w", path, err), a.win)
 		return
 	}
