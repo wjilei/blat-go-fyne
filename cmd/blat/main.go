@@ -200,7 +200,9 @@ func runConsole(plan *config.Plan, vars map[string]any, debug bool) int {
 	reg := cases.Global()
 	pr := runtime.NewPlanRunner(reg)
 	rep := report.NewMulti(
-		report.NewYAMLFile("."),
+		// Console 模式：写到 DefaultReportDir 目录下带时间戳的 report_<ts>.yml。
+		// release → ~/.blat/；dev（go run）→ "."，便于直接在 cwd 找产物。
+		report.NewYAMLFile(config.DefaultReportDir()),
 		report.NewTAP(nil),
 		// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
 		// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。
@@ -255,6 +257,8 @@ func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, deb
 	gui.SetDebug(debug)
 	// 用户配置（MBUS 串口等）落盘路径。默认 ~/.blat/env.yml，可由 --env 覆盖。
 	gui.SetVarsFile(varsFile)
+	// YAML 报告落盘路径。release → ~/.blat/report.yml；dev（go run）→ ./report.yml。
+	gui.SetReportFile(config.DefaultReportPath())
 	gui.SetPlanList(items, selectPath)
 
 	// Block on the Fyne event loop. Closing the window cancels any

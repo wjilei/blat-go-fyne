@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"blat/internal/config"
 	"blat/internal/logfile"
 )
 
@@ -36,6 +37,8 @@ type Console struct {
 // stdout. The log writer is also stdout by default; pass NewConsoleWith to
 // redirect it. 日志文件 test.log 在打开时清空重写（Console 模式每次进程
 // 启动视为一次运行；GUI 模式由 App.startRun 每次点击"开始测试"清空）。
+// 落盘路径由 config.DefaultTestLogPath 决定：release → ~/.blat/test.log，
+// dev（go run）→ ./test.log。
 func NewConsole() *Console {
 	c := &Console{
 		r:   bufio.NewReader(os.Stdin),
@@ -43,7 +46,7 @@ func NewConsole() *Console {
 		log: os.Stdout,
 		cap: 1000,
 	}
-	if f, err := logfile.Open("test.log"); err == nil {
+	if f, err := logfile.Open(config.DefaultTestLogPath()); err == nil {
 		_ = f.Truncate()
 		c.file = f
 	} else {

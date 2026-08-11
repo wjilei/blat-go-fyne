@@ -173,6 +173,12 @@ type App struct {
 	// 放在用户家目录下以避开 %PROGRAMFILES% 的只读权限——安装目录写不进去。
 	varsFile string
 
+	// reportFile 是测试报告 YAML 落盘路径。由 main 在启动时通过 SetReportFile
+	// 注入，OnPlanStart 在此路径上 NewYAMLPath（每次跑清空）。release 模式默认
+	// ~/.blat/report.yml（config.DefaultReportPath）；dev 模式默认 ./report.yml。
+	// 空字符串时 OnPlanStart 用 config.DefaultReportPath() 兜底。
+	reportFile string
+
 	mu         sync.Mutex
 	tapPartial bytes.Buffer // 暂存未完成（无换行结尾）的 TAP 半行
 	rows       []row
@@ -266,10 +272,11 @@ func New(title string) *App {
 	// 工厂车间多为浅色屏幕；固定浅色主题，避免系统深色模式下日志对比度过低。
 	fa.Settings().SetTheme(theme.LightTheme())
 	win := fa.NewWindow(title)
-	// 日志文件 test.log 放当前工作目录（对齐 Perl run_dir/test.log）。
+	// 日志文件 test.log：release → ~/.blat/test.log；dev（go run）→ ./test.log。
+	// 路径由 config.DefaultTestLogPath 决定，依据 exe 是否在 %ProgramFiles% 下。
 	// 启动时不截断——旧日志保留在文件里，首次刷新从文件末尾增量读，
 	// 不把上次运行的内容灌进 UI；每次点击"开始测试"由 startRun 截断。
-	logf, lerr := logfile.Open("test.log")
+	logf, lerr := logfile.Open(config.DefaultTestLogPath())
 	if lerr != nil {
 		fmt.Fprintln(os.Stderr, "open test.log:", lerr)
 		logf = nil
@@ -288,6 +295,7 @@ func New(title string) *App {
 		logOff:    logOff,
 		logGen:    logGen,
 		varsFile:  "", // 由 main 在启动时通过 SetVarsFile 注入，路径默认 ~/.blat/env.yml
+		reportFile: "", // 由 main 在启动时通过 SetReportFile 注入，空时回退 config.DefaultReportPath()
 		promptCh:  make(chan promptReq, 8),
 		confirmCh: make(chan confirmReq, 8),
 		yesNoCh:   make(chan yesNoReq, 8),
@@ -792,6 +800,27 @@ func (a *App) SetVarsFile(path string) {
 	a.mu.Lock()
 	a.varsFile = path
 	a.mu.Unlock()
+}
+
+// SetReportFile 设置 YAML 报告落盘路径。供 main 在启动时调用；空串时
+// OnPlanStart 用 config.DefaultReportPath() 兜底（release → ~/.blat/report.yml，
+// dev → ./report.yml）。
+func (a *App) SetReportFile(path string) {
+	a.mu.Lock()
+	a.reportFile = path
+	a.mu.Unlock()
+}
+
+// reportFileOrDefault 返回有效报告路径：已注入的 a.reportFile，或回退到
+// config.DefaultReportPath()。OnPlanStart 通过它把 reporter 写到正确位置。
+func (a *App) reportFileOrDefault() string {
+	a.mu.Lock()
+	rf := a.reportFile
+	a.mu.Unlock()
+	if rf != "" {
+		return rf
+	}
+	return config.DefaultReportPath()
 }
 
 // isDebug 返回当前是否处于 --debug 模式（供 goroutine 中安全读取）。
@@ -1385,8 +1414,8 @@ func (a *App) startRun() {
 		pr := runtime.NewPlanRunner(reg)
 		adp := &guiAdapter{gui: a} // 留出引用以便退出前标记取消态
 		rep := report.NewMulti(
-			report.NewYAMLPath("report.yml"), // 固定文件名 + 每次开始时清空
-			report.NewTAP(&tapWriter{a: a}),  // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
+			report.NewYAMLPath(a.reportFileOrDefault()), // 固定文件名 + 每次开始时清空
+			report.NewTAP(&tapWriter{a: a}),             // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
 			adp,
 			// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
 			// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。

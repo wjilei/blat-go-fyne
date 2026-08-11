@@ -103,7 +103,12 @@ blat-go-fyne/
 - **runtime**：case 注册名沿用 Perl 的 `<Suite>::<Method>` 风格（如 `HeatSuite::wire_valve_bluetooth_test_all_params`），用显式 Registry 避免反射。
 - **config**：plan 为顶层 YAML 序列，保留字段 `name/title/desc/case_seq/counts/parallel`，其余键平铺进 `Args` 传给 case。`TestModeFromPlanPath` 从文件名解析模式：`confs/plan_PSAV_ut_check_state.yml` → `ut_check_state`。
 - **device/bluetooth**：**故意不实现 core.Device**。挂在 `env.Devs["bluetooth"]`（main 注入 `NewDevice()` = real）。mock/real 由 `NewMockDevice`/`NewRealDevice` 构造；`bt_mock` 标志决定 case 端选哪个。协议帧头字节：PSAV→`f9`、其它→`f8`；GATT 服务 `0xfff0`、特征 `0xfff2`。mac 由序列号经 `ParseIdToMac(id)` 派生。真实 BLE 的所有 tinygo 调用投递到专用串行 executor goroutine 依次执行（规避 Windows 上非主线程并发调用崩溃，tinygo issue #294）。常用方法：`Connect/Disconnect/Reboot/Read/ResetValve/EnableNbiot/DisableNbiot/SetDevType/SetLogger/SetMockStatus/IsConnected`。mock 默认数据保证 PSAV 流程首读通过（NbRssi≥−81 → NB ok、ValveState=0）。
-- **ui/fyne**：UI 变更一律 `fyne.Do` 上主线程；`Prompt`/`WaitContinue` 通过 `promptReq`/`confirmReq` 异步通道弹框实现；配置弹框把 MBUS 端口等持久化到 `%USERPROFILE%\.blat\env.yml`（与 `uploader.uuid.txt` 同目录，规避安装目录只读）。`SaveEnv` 落盘时只写 `HeatNote.mbus.{baudRate,parity,port}` 三个字段——其余运行时字段（`TEST_WORKSTATION` / `HeatNote.bt_mock` / `HeatNote.plan` / `HeatNote.bluetooth` 等）不混入用户配置。
+- **ui/fyne**：UI 变更一律 `fyne.Do` 上主线程；`Prompt`/`WaitContinue` 通过 `promptReq`/`confirmReq` 异步通道弹框实现。**用户运行时产物都落在 `%USERPROFILE%\.blat\`**（与 `uploader.uuid.txt` 同目录，规避安装目录只读）：
+  - `env.yml` — 配置（MBUS 端口等），`SaveEnv` 落盘时只写 `HeatNote.mbus.{baudRate,parity,port}` 三个字段——其余运行时字段（`TEST_WORKSTATION` / `HeatNote.bt_mock` / `HeatNote.plan` / `HeatNote.bluetooth` 等）不混入用户配置。
+  - `test.log` — 测试日志（每次点击"开始测试"由 `startRun` 截断，上报时全量读取）。
+  - `report.yml` — YAML 测试报告（GUI 模式固定文件名；Console 模式生成 `report_<ts>.yml`）。
+
+  **dev / release 切换**：release（NSIS 安装到 `%ProgramFiles%`）→ 三个文件都落到 `~/.blat/`；dev（`go run` / `go build` 直接运行）→ `test.log` / `report.yml` 落到 cwd，便于 `ls` 找产物（`env.yml` 永远走 `~/.blat/`，与发布模式一致）。强制覆盖：env `BLAT_DEV_FILES=1` 切 dev，`=release` 切 release，自动检测看 `os.Executable()` 是否在 `%ProgramFiles%` 子树下（详见 `config.isInstalledExe`）。
 - **uploader**：`HookStopReporter` 实现 `report.Reporter`，`OnPlanStop` 时把 Console/GUI 环形缓冲的完整日志 LZMA 压缩上传 OSS，并把测试记录 POST 到 BLAT 后台（对齐 Perl `hook_stop`）；`--debug` 时不触网仅打印。`GetTestRecord` 查询整机测试记录（devType=2）。
 - **serial**：`ListPorts()` 读注册表 `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM`，按 COM 数字排序去重。刻意不用第三方串口库，保持 cgo-free。
 
