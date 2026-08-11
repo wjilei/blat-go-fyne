@@ -53,9 +53,9 @@ fyne.Do(func() {
 
 ## 用例文件名不要以 _test.go 结尾
 
-**规则**：`cmd/hello/cases/` 下实现用例的 .go 文件**绝不能**以 `_test.go` 结尾（如 `wire_valve_bluetooth_test.go`）。
+**规则**：`cmd/blat/cases/` 下实现用例的 .go 文件**绝不能**以 `_test.go` 结尾（如 `wire_valve_bluetooth_test.go`）。
 
-**原因**：`_test.go` 后缀是 Go 约定的测试文件命名，Go 工具链只会在 `go test` 时编译它，`go build` / `go run` / 产出的 exe **完全排除**这类文件。用例靠 `init()` 里的 `Register` 注册，文件不进 exe → 运行时报 `case not registered: <Suite>::<Method>`，但 `go test ./cmd/hello/cases/` 却一切正常（测试二进制含该文件），极难定位。
+**原因**：`_test.go` 后缀是 Go 约定的测试文件命名，Go 工具链只会在 `go test` 时编译它，`go build` / `go run` / 产出的 exe **完全排除**这类文件。用例靠 `init()` 里的 `Register` 注册，文件不进 exe → 运行时报 `case not registered: <Suite>::<Method>`，但 `go test ./cmd/blat/cases/` 却一切正常（测试二进制含该文件），极难定位。
 
 **注意**：
 - 纯用例实现文件（含 `init() Register` 与辅助函数）命名为 `xxx.go`（如 `wire_valve_bluetooth.go`），不带 `_test`。
@@ -68,7 +68,7 @@ BLAT 工厂测试框架的 Go 移植版（原 Perl），带 Fyne 桌面 GUI。�
 
 ```
 blat-go-fyne/
-├── cmd/hello/               # 唯一入口
+├── cmd/blat/               # 唯一入口
 │   ├── main.go              # flag 解析、env/plan 装配、GUI 或 Console 启动、跑完释放蓝牙
 │   └── cases/               # 用例包：init() 自动 Register 到全局 Registry
 │       ├── cases.go         # global Registry + Register(name, factory)
@@ -95,7 +95,7 @@ blat-go-fyne/
 
 ### 核心流程（数据流）
 
-`cmd/hello/main.go` 加载 `confs/uploader.yml`（凭据注入 uploader）→ 加载 `--env`（默认 `confs/env.yml`，写入 `Env.Vars`）→ 注入 `Vars.HeatNote.bt_mock`（bool）与 `Vars.HeatNote.plan` → 用 `cases.Global()` 构造 `runtime.PlanRunner` → `RunPlan` 按 plan 顺序 Invoke 每个 case（counts 次）→ 每步发 Reporter 事件 → 结束后 `report.NewMulti(YAML, TAP, uploader.HookStopReporter)` 落盘 + 上报 → 跑完 `disconnectBluetooth` 释放连接。
+`cmd/blat/main.go` 加载 `confs/uploader.yml`（凭据注入 uploader）→ 加载 `--env`（默认 `confs/env.yml`，写入 `Env.Vars`）→ 注入 `Vars.HeatNote.bt_mock`（bool）与 `Vars.HeatNote.plan` → 用 `cases.Global()` 构造 `runtime.PlanRunner` → `RunPlan` 按 plan 顺序 Invoke 每个 case（counts 次）→ 每步发 Reporter 事件 → 结束后 `report.NewMulti(YAML, TAP, uploader.HookStopReporter)` 落盘 + 上报 → 跑完 `disconnectBluetooth` 释放连接。
 
 ### 各包要点
 
@@ -110,17 +110,15 @@ blat-go-fyne/
 ### 运行方式
 
 ```powershell
-go run ./cmd/hello                                  # Fyne GUI（工具栏选择计划并开始）
-go run ./cmd/hello -no-gui --plan confs/plan_PSAV_ut_resetvalve.yml --env confs/env.yml   # 无头控制台
-go run ./cmd/hello -mock-bt=true                    # 蓝牙用 mock（无硬件调试）
-go run ./cmd/hello --debug                          # 上报只打印不触网
+go run ./cmd/blat                                  # Fyne GUI（工具栏选择计划并开始）
+go run ./cmd/blat -no-gui --plan confs/plan_PSAV_ut_resetvalve.yml --env confs/env.yml   # 无头控制台
+go run ./cmd/blat -mock-bt=true                    # 蓝牙用 mock（无硬件调试）
+go run ./cmd/blat --debug                          # 上报只打印不触网
 ```
 
 ### 关键约定
 
 - **HeatNote**：`env.yml` 顶层 key，存放产线参数（`serial/lot/model/pn/mbus/tenant_id/user/bt_mock/plan` 等），case 运行期也把蓝牙实例写回 `HeatNote["bluetooth"]` 供后续 case 复用。键名大写。
 - **蓝牙连接复用**：所有蓝牙用例统一走 `_ensureBluetooth`（cases 包）：优先取 `HeatNote["bluetooth"]`；否则仅当 `Devs["bluetooth"]` 实例模式与 `bt_mock` 一致才兜底复用，再否则按 `bt_mock` 新建 mock/real 并写回。**不要**无条件 fallback 到 `env.Devs["bluetooth"]`——main 默认注入 real，会让 `-mock-bt=true` 拿不到 mock。
-- **新加用例**：在 `cmd/hello/cases/` 下新建文件，实现 `core.Case`（可加 `Configure`），`init()` 里 `Register("<Suite>::<方法名>", ...)`，然后在 plan YAML 里按名字引用。
+- **新加用例**：在 `cmd/blat/cases/` 下新建文件，实现 `core.Case`（可加 `Configure`），`init()` 里 `Register("<Suite>::<方法名>", ...)`，然后在 plan YAML 里按名字引用。
 - **新加计划**：plan 文件放 `confs/`，按 `plan_<设备类型>_<模式>.yml` 命名；GUI 下拉框选项在 `main.go` 的 `builtinPlans` 里追加。
-
-

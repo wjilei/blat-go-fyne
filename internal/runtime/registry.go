@@ -117,7 +117,7 @@ func (p *PlanRunner) RunPlan(
 						Error:  err.Error(),
 					})
 				}
-				finish("invoke " + item.Name + ": " + err.Error())
+				finish(item.Title)
 				return err
 			}
 			// Inject YAML args if the case supports it.

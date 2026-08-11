@@ -341,14 +341,6 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 	if h.logSrc != nil {
 		log = h.logSrc()
 	}
-	// log 字段过大容易触发后端 WAF/body size 限制而被拒（之前返回
-	// "您的请求参数存在错误,系统已阻止了您的请求 - Log"）。保留头部
-	// maxLogBytes 字节；日志启动阶段的关键错误通常都在前段。
-	const maxLogBytes = 256 * 1024
-	if len(log) > maxLogBytes {
-		h.env.Log.Warn(fmt.Sprintf("日志过长 (%d 字节)，截断到前 %d 字节", len(log), maxLogBytes))
-		log = log[:maxLogBytes] + "\n[... log truncated ...]\n"
-	}
 	reporter := buildReporter(sum, h.env.Vars, h.startTime, log)
 
 	// 把请求字段摘要打到 UI 日志（完整 payload 已在 SaveTestData 用

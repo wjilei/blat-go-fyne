@@ -6,7 +6,7 @@
 //
 // It intentionally does NOT implement core.Device (Open/Close/Command):
 // it lives above the low level driver layer and is injected into
-// env.Devs["mbus"] by the application (cmd/hello/main.go), then
+// env.Devs["mbus"] by the application (cmd/blat/main.go), then
 // type-asserted by the Case that owns it (wire_valve_mbus_read_motor).
 //
 // Two operating modes:
@@ -38,7 +38,7 @@ import (
 var errNotConnected = errors.New("mbus 设备未连接")
 
 // Logger 是 mbus 包可选的日志输出接口。契约要求 Info(args ...any)
-// （调用侧 cmd/hello/cases 的 mbusLogAdapter 按此签名适配 core.Logger）。
+// （调用侧 cmd/blat/cases 的 mbusLogAdapter 按此签名适配 core.Logger）。
 // nil 时静默跳过日志。
 type Logger interface {
 	Info(args ...any)

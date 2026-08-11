@@ -4,3 +4,4 @@ bin/
 *.out
 report*.yml
 confs/uploader.yml
+.opencode

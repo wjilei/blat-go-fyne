@@ -31,7 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"blat/cmd/hello/cases"
+	"blat/cmd/blat/cases"
 	"blat/internal/config"
 	"blat/internal/core"
 	"blat/internal/device/bluetooth"

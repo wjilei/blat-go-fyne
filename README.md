@@ -7,7 +7,7 @@ Go port of the BLAT factory test framework, kept as a minimal reference.
 ```
 blat-go/
 ├── go.mod
-├── cmd/hello/main.go        # the minimal reference application
+├── cmd/blat/main.go        # the minimal reference application
 ├── internal/
 │   ├── core/                # App, Suite, Case, Runner, Env
 │   │   ├── app.go
