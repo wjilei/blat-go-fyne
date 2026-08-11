@@ -20,11 +20,14 @@ func fakeSTSHandler(expOffset time.Duration, calls *atomic.Int32, lastAuth *atom
 		calls.Add(1)
 		h := r.Header.Get("Authorization")
 		lastAuth.Store(h)
-		resp := map[string]string{
-			"accessKeyId":     "STS.ak",
-			"accessKeySecret": "STS.sk",
-			"securityToken":   "STS.token",
-			"expiration":      time.Now().Add(expOffset).UTC().Format(time.RFC3339),
+		resp := map[string]any{
+			"data": map[string]string{
+				"accessKeyId":     "STS.ak",
+				"accessKeySecret": "STS.sk",
+				"securityToken":   "STS.token",
+				"expiration":      time.Now().Add(expOffset).UTC().Format(time.RFC3339),
+			},
+			"result": true,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -120,11 +123,14 @@ func TestUploadLogOSS_STSExpiryForcesRefresh(t *testing.T) {
 		if idx == 2 {
 			offset = 15 * time.Minute
 		}
-		resp := map[string]string{
-			"accessKeyId":     fmt.Sprintf("STS.ak%d", idx),
-			"accessKeySecret": fmt.Sprintf("STS.sk%d", idx),
-			"securityToken":   fmt.Sprintf("STS.token%d", idx),
-			"expiration":      time.Now().Add(offset).UTC().Format(time.RFC3339),
+		resp := map[string]any{
+			"data": map[string]string{
+				"accessKeyId":     fmt.Sprintf("STS.ak%d", idx),
+				"accessKeySecret": fmt.Sprintf("STS.sk%d", idx),
+				"securityToken":   fmt.Sprintf("STS.token%d", idx),
+				"expiration":      time.Now().Add(offset).UTC().Format(time.RFC3339),
+			},
+			"result": true,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -168,11 +174,14 @@ func TestUploadLogOSS_STSServerErrorRetried(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		resp := map[string]string{
-			"accessKeyId":     "STS.ak",
-			"accessKeySecret": "STS.sk",
-			"securityToken":   "STS.token",
-			"expiration":      time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339),
+		resp := map[string]any{
+			"data": map[string]string{
+				"accessKeyId":     "STS.ak",
+				"accessKeySecret": "STS.sk",
+				"securityToken":   "STS.token",
+				"expiration":      time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339),
+			},
+			"result": true,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -221,5 +230,59 @@ func TestUploadLogOSS_PutObjectErrorPropagates(t *testing.T) {
 
 	if err := UploadLogOSS(context.Background(), "p", []byte("y")); err == nil {
 		t.Fatal("UploadLogOSS() error = nil, want OSS 持续失败时返回 error")
+	}
+}
+
+// TestParseExpiration_GoDefaultFormat 验证能解析 Go time.Time.String() 默认格式，
+// 即 BLAT 后台 auth_handler.go 中 resp.Credentials.Expiration.String() 的输出。
+func TestParseExpiration_GoDefaultFormat(t *testing.T) {
+	now := time.Date(2025, 8, 11, 16, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name    string
+		input   string
+		want    time.Time
+		wantZero bool
+	}{
+		{
+			name: "RFC3339",
+			input: "2025-08-11T16:00:00Z",
+			want: now,
+		},
+		{
+			name: "Go default no fractional",
+			input: "2025-08-11 16:00:00 +0000 UTC",
+			want: now,
+		},
+		{
+			name: "Go default with fractional",
+			input: "2025-08-11 16:00:00.123456789 +0000 UTC",
+			want: time.Date(2025, 8, 11, 16, 0, 0, 123456789, time.UTC),
+		},
+		{
+			name:    "empty string",
+			input: "",
+			wantZero: true,
+		},
+		{
+			name:    "garbage",
+			input: "not-a-time",
+			wantZero: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseExpiration(tt.input)
+			if tt.wantZero {
+				if !got.IsZero() {
+					t.Errorf("parseExpiration(%q) = %v, want zero", tt.input, got)
+				}
+				return
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("parseExpiration(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }

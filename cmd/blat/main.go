@@ -222,7 +222,7 @@ func disconnectBluetooth(env *core.Env) {
 }
 
 func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, debug bool) int {
-	gui := fyneui.New("blat-go hello")
+	gui := fyneui.New("BLAT测试程序")
 
 	env := &core.Env{
 		Ctx:  context.Background(),

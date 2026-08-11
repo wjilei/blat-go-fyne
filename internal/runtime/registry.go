@@ -133,7 +133,7 @@ func (p *PlanRunner) RunPlan(
 							Error:  err.Error(),
 						})
 					}
-					finish("configure " + item.Name + ": " + err.Error())
+					finish(item.Title)
 					return fmt.Errorf("configure %s: %w", item.Name, err)
 				}
 			}
@@ -165,7 +165,7 @@ func (p *PlanRunner) RunPlan(
 				rep.OnCaseStop(testNo, cr)
 			}
 			if runErr != nil {
-				finish("case " + item.Name + " failed: " + runErr.Error())
+				finish(item.Title)
 				return fmt.Errorf("case %s failed: %w", item.Name, runErr)
 			}
 		}
