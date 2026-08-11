@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -102,17 +103,23 @@ func UploadLogOSS(ossPath string, content []byte) error {
 
 // fatalHTTPError 表示服务器返回 400/401/500，按 BLAT do_request 的规则应
 // 立即失败、不再重试。用类型区分是为了让 SaveTestData 能决定是否继续尝试。
+// body 保留响应体原文，方便排查 400 这类参数错误。
 type fatalHTTPError struct {
 	status int
+	body   string
 }
 
 func (e *fatalHTTPError) Error() string {
-	return fmt.Sprintf("服务器返回 %d，不再重试", e.status)
+	if e.body == "" {
+		return fmt.Sprintf("服务器返回 %d，不再重试", e.status)
+	}
+	return fmt.Sprintf("服务器返回 %d，不再重试，响应体: %s", e.status, e.body)
 }
 
 // SaveTestData 把测试记录 POST 到 BLAT 服务器数据库，模拟 BLAT 的
 // _SaveTestData + http_post + do_request（最多重试 3 次）。
 // 400/401/500 立即失败；其余失败用 500ms 短 sleep 后重试。
+// 入口处把请求 URL 与 payload 打到 stderr，便于排查后台 400。
 func SaveTestData(data map[string]any, devType string) error {
 	payload, err := json.Marshal(data)
 	if err != nil {
@@ -120,6 +127,7 @@ func SaveTestData(data map[string]any, devType string) error {
 	}
 
 	url := cfg.Blat.BaseURL + "/v1/tests/records?dev_type=" + devType
+	log.Printf("[uploader] SaveTestData POST %s dev_type=%s payload=%s", url, devType, payload)
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		err := postJSON(url, payload)
@@ -196,9 +204,9 @@ func postJSON(url string, payload []byte) error {
 
 	switch resp.StatusCode {
 	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusInternalServerError:
-		return &fatalHTTPError{status: resp.StatusCode}
+		return &fatalHTTPError{status: resp.StatusCode, body: string(body)}
 	default:
-		return fmt.Errorf("服务器返回非 2xx 状态码 %d", resp.StatusCode)
+		return fmt.Errorf("服务器返回非 2xx 状态码 %d，响应体: %s", resp.StatusCode, string(body))
 	}
 }
 
@@ -299,9 +307,10 @@ func getJSON(url string) (any, error) {
 // HookStopReporter 实现 report.Reporter 接口：在计划全部跑完（OnPlanStop）时
 // 触发 hook_stop 上报逻辑，其余生命周期事件忽略。
 type HookStopReporter struct {
-	env     *core.Env
-	logSrc  func() string // 日志内容来源；可为 nil
-	skipOSS bool          // --debug：不实际上传/保存，把上报数据打印到日志
+	env       *core.Env
+	logSrc    func() string // 日志内容来源；可为 nil
+	skipOSS   bool          // --debug：不实际上传/保存，把上报数据打印到日志
+	startTime time.Time     // OnPlanStart 记录的计划开始时间，用于 last_start_time
 }
 
 // NewHookStop 创建上报用的 Reporter。logSrc 在计划结束时才被调用，
@@ -312,9 +321,11 @@ func NewHookStop(env *core.Env, logSrc func() string, skipOSS bool) *HookStopRep
 	return &HookStopReporter{env: env, logSrc: logSrc, skipOSS: skipOSS}
 }
 
-func (h *HookStopReporter) OnPlanStart(total int, startTime time.Time) {}
-func (h *HookStopReporter) OnCaseStart(seq int, cr report.CaseReport)  {}
-func (h *HookStopReporter) OnCaseStop(seq int, cr report.CaseReport)   {}
+func (h *HookStopReporter) OnPlanStart(total int, startTime time.Time) {
+	h.startTime = startTime
+}
+func (h *HookStopReporter) OnCaseStart(seq int, cr report.CaseReport) {}
+func (h *HookStopReporter) OnCaseStop(seq int, cr report.CaseReport)  {}
 
 // OnPlanStop 在测试全部跑完后触发日志上传与测试记录存库。
 func (h *HookStopReporter) OnPlanStop(sum report.Summary) {
@@ -330,7 +341,25 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 	if h.logSrc != nil {
 		log = h.logSrc()
 	}
-	reporter := buildReporter(sum, h.env.Vars, log)
+	// log 字段过大容易触发后端 WAF/body size 限制而被拒（之前返回
+	// "您的请求参数存在错误,系统已阻止了您的请求 - Log"）。保留头部
+	// maxLogBytes 字节；日志启动阶段的关键错误通常都在前段。
+	const maxLogBytes = 256 * 1024
+	if len(log) > maxLogBytes {
+		h.env.Log.Warn(fmt.Sprintf("日志过长 (%d 字节)，截断到前 %d 字节", len(log), maxLogBytes))
+		log = log[:maxLogBytes] + "\n[... log truncated ...]\n"
+	}
+	reporter := buildReporter(sum, h.env.Vars, h.startTime, log)
+
+	// 把请求字段摘要打到 UI 日志（完整 payload 已在 SaveTestData 用
+	// log.Printf 写到 stderr，但 GUI 模式看不到），便于下次后端 4xx
+	// 时不用切终端就能定位是哪个字段出问题。log 字段只打字节数不打内容。
+	if h.env.Log != nil {
+		h.env.Log.Info(fmt.Sprintf(
+			"SaveTestData POST %s?dev_type=%s test_result=%v serial_num=%v last_start_time=%v log_bytes=%d",
+			cfg.Blat.BaseURL+"/v1/tests/records", devTypeHeat,
+			reporter["test_result"], reporter["serial_num"], reporter["last_start_time"], len(log)))
+	}
 
 	if h.skipOSS {
 		// debug 模式：不触网，把要保存的数据（含原始日志）打印到日志。
@@ -357,6 +386,9 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 		h.env.Log.Error("日志上传OSS失败: " + err.Error())
 	} else {
 		h.env.Log.Info("日志已上传OSS: " + ossPath)
+		// 日志已上传到 OSS，把 reporter 的 log 字段替换成 OSS 路径，
+		// 避免把整段日志正文再次塞进数据库请求体（既冗余又容易触发 WAF/body size 限制）。
+		reporter["log"] = ossPath
 	}
 
 	// HeatSaveTestData：把测试记录写入 BLAT 服务器数据库
@@ -369,7 +401,9 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 
 // buildReporter 组装 POST 到 BLAT 服务器的字段，JSON 键名与 BLAT hook_stop
 // 完全一致。大多数字段来自 HeatNote（扫码信息），缺省时回退到环境变量。
-func buildReporter(sum report.Summary, vars map[string]any, log string) map[string]any {
+// startTime 是 OnPlanStart 时记录的本次计划开始时间，作为 last_start_time 上报
+// （后端 CreateHeatTestDataRequest.LastStartTime 要求 int64 unix 秒）。
+func buildReporter(sum report.Summary, vars map[string]any, startTime time.Time, log string) map[string]any {
 	hn, _ := vars["HeatNote"].(map[string]any)
 	if hn == nil {
 		hn = map[string]any{}
@@ -378,11 +412,12 @@ func buildReporter(sum report.Summary, vars map[string]any, log string) map[stri
 	if sum.Result == "pass" {
 		testResult = 1
 	}
-	// last_start_time 保留 hn["start_time"] 原值（可能是 int unix 秒或 string），
-	// 不上报时留空串即可
-	lastStart := hn["start_time"]
-	if lastStart == nil {
-		lastStart = ""
+	// 后端 int64；startTime 为零值时留 0（omitempty 不输出）。原来取
+	// hn["start_time"] 可能是 string，后端无法反序列化，所以直接用
+	// OnPlanStart 时间戳，避免再依赖扫码字段。
+	var lastStart int64
+	if !startTime.IsZero() {
+		lastStart = startTime.Unix()
 	}
 	return map[string]any{
 		"test_result":     testResult,
@@ -396,7 +431,7 @@ func buildReporter(sum report.Summary, vars map[string]any, log string) map[stri
 		"log":             log,
 		"last_start_time": lastStart,
 		"tool_version":    "",
-		"workstation":     "",
+		"workstation":     toStr(vars["TEST_WORKSTATION"], ""),
 		"tenant_id":       toStr(hn["tenant_id"], ""),
 		"fail_reason":     sum.Reason,
 	}

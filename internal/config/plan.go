@@ -24,9 +24,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// planModeRe 匹配计划文件名中的测试模式：形如 PSAV_<mode>.yml / PFW_<mode>.yml
-// （允许 plan_ 等前缀，大小写不敏感）。捕获组 1 是 PSAV_/PFW_ 后到 .yml 前的内容。
-var planModeRe = regexp.MustCompile(`(?i)(?:PSAV|PFW)_(.+)\.ya?ml$`)
+// planModeRe 匹配计划文件名中的测试模式：形如 PSAV_<mode>.yml / PTVB1_<mode>.yml
+// （允许 plan_ 等前缀，大小写不敏感）。捕获组 1 是 PSAV_/PTVB1_ 后到 .yml 前的内容。
+var planModeRe = regexp.MustCompile(`(?i)(?:PSAV|PTVB1)_(.+)\.ya?ml$`)
 
 // TestModeFromPlanPath 从计划文件名解析测试模式：匹配 PSAV_(XXX).yml /
 // PFW_(XXX).yml，返回括号里的 XXX 作为 test_mode；不匹配时返回空串。

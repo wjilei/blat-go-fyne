@@ -46,9 +46,9 @@ import (
 // builtinPlans 是测试计划下拉框的内置选项。每项对应一个 plan.yml 文件，
 // 显示名按产线实际计划自定义；新增计划只需在此追加一项。
 var builtinPlans = []fyneui.PlanItem{
-	{Name: "平衡阀初始化电机", Path: "confs/plan_PSAV_ut_resetvalve.yml"},
-	{Name: "平衡阀检查参数", Path: "confs/plan_PSAV_ut_check_state.yml"},
-	{Name: "户控阀检查电机状态", Path: "confs/plan_PTVB1_ut_check_motor.yml"},
+	{Name: "平衡阀初始化电机", Path: "confs/plan_PSAV_normal_ut_resetvalve.yml"},
+	{Name: "平衡阀检查参数", Path: "confs/plan_PSAV_normal_ut_checkstate.yml"},
+	{Name: "户控阀检查电机状态", Path: "confs/plan_PTVB1_normal_ut_checkmotor.yml"},
 }
 
 // planInList 报告 path 是否已存在于 items（按规范化路径比较）。
@@ -105,6 +105,20 @@ func main() {
 		}
 	}
 
+	// 启动期一次性获取本机工位信息（对应 BLAT app.pl:472-476 GUI 启动时调
+	// _get_work_station_info）：复用 uploader.Init 已注入的 BLAT 凭据，结果
+	// 写入 env.Vars["TEST_WORKSTATION"] 供 hook_stop 上报与 OSS 日志路径使用。
+	// 任意一步失败都只打 stderr，warn-and-continue——OSS 路径与上报字段都
+	// 已有空串回退（uploader.go:347、:399），不阻塞启动。
+	pcUUID, uuidErr := uploader.GetOrCreatePCUUID()
+	if uuidErr != nil {
+		fmt.Fprintln(os.Stderr, "获取本机 UUID 失败:", uuidErr)
+	}
+	ws, wsErr := uploader.GetWorkstationInfo(pcUUID, uploader.GetPCOSVersion())
+	if wsErr != nil {
+		fmt.Fprintln(os.Stderr, "获取工位信息失败:", wsErr)
+	}
+
 	vars := map[string]any{}
 	if *envPath != "" {
 		// 文件不存在视为"未配置"，vars 留空；其它错误才退出。
@@ -120,6 +134,7 @@ func main() {
 			os.Exit(2)
 		}
 	}
+	vars["TEST_WORKSTATION"] = ws
 
 	// 注入蓝牙 mock 开关（两分支共用）：case 端据此选择构造 mock 还是 real
 	// 设备。HeatNote 键是大写且必须存在，bt_mock 存 bool。
@@ -222,6 +237,9 @@ func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, deb
 	// plan 的生命周期由下拉框接管：Attach 时 plan 传 nil，下拉框选中/清空
 	// 时由 GUI 内部加载计划、重建用例树并写入 env.Vars["HeatNote"]["plan"]。
 	gui.Attach(nil, env, reg)
+	// 启动期工位已由 main 写入 env.Vars["TEST_WORKSTATION"]，这里把它同步到
+	// 工具栏的工位标签——workstation 启动后不再变化，调一次即可。
+	gui.SyncWorkstationLabel()
 	// --debug：跳过日志上传 OSS，日志以原始文本随测试记录存库。
 	gui.SetDebug(debug)
 	gui.SetPlanList(items, selectPath)

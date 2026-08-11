@@ -38,6 +38,7 @@ package fyneui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"os"
@@ -154,17 +155,18 @@ type App struct {
 	fa  fyne.App
 	win fyne.Window
 
-	log       *SelectableRichText
-	logScroll *container.Scroll
-	tree      *widget.Tree
-	status    *widget.Label
-	prog      *widget.ProgressBar
-	startBtn  *widget.Button
-	configBtn *widget.Button
-	planSel     *widget.Select // 测试计划下拉框
-	planItems   []PlanItem     // 下拉框选项（显示名→plan.yml 路径），受 mu 保护
-	serialLabel *widget.Label  // 工具栏右侧的"当前测试序列号"标签
-	resultLabel *widget.Label  // 工具栏最右侧的"最终测试结果"标签（粗体、标题字号）
+	log              *SelectableRichText
+	logScroll        *container.Scroll
+	tree             *widget.Tree
+	status           *widget.Label
+	prog             *widget.ProgressBar
+	startBtn         *widget.Button
+	configBtn        *widget.Button
+	planSel          *widget.Select // 测试计划下拉框
+	planItems        []PlanItem     // 下拉框选项（显示名→plan.yml 路径），受 mu 保护
+	serialLabel      *widget.Label  // 工具栏右侧的"当前测试序列号"标签
+	workstationLabel *widget.Label  // 工具栏右侧的"当前工位"标签（启动期从 env.Vars 一次性拉取）
+	resultLabel      *widget.Label  // 工具栏最右侧的"最终测试结果"标签（粗体、标题字号）
 
 	// varsFile 是配置（MBUS 串口等）持久化的目标文件路径；相对工作目录。
 	// 启动时 main 用 config.LoadEnv(varsFile) 读入 env.Vars，配置弹框
@@ -550,6 +552,14 @@ func (a *App) build() {
 	a.serialLabel.SizeName = theme.SizeNameHeadingText
 	a.serialLabel.TextStyle = fyne.TextStyle{Bold: true}
 
+	// 工具栏右侧"当前工位"标签：启动期由 syncWorkstationLabel 从
+	// env.Vars["TEST_WORKSTATION"] 一次性拉取，启动后不再变化。
+	// 与序列号标签同字号同字重，便于操作员一眼锁定"哪台工位在测"。
+	a.workstationLabel = widget.NewLabel("")
+	a.workstationLabel.Importance = widget.MediumImportance
+	a.workstationLabel.SizeName = theme.SizeNameHeadingText
+	a.workstationLabel.TextStyle = fyne.TextStyle{Bold: true}
+
 	// 工具栏最右侧"最终测试结果"标签：粗体 + 标题字号。测试中 Hide，
 	// 跑完（OnPlanStop）Show 并由 planResultLabel 决定填"成功"/"失败"/"已取消"。
 	a.resultLabel = widget.NewLabel("")
@@ -558,9 +568,10 @@ func (a *App) build() {
 	a.resultLabel.Hide() // 默认隐藏，跑完测试再显示
 
 	// 工具栏：左侧操作（开始/结束、配置、计划下拉） + 弹性间隔 + 右侧
-	// 序列号 + 最终结果。结果标签紧跟序列号，便于操作员一眼确认本轮结论。
+	// 工位 + 序列号 + 最终结果。工位与序列号同视觉权重，便于一眼确认
+	// "哪个工位在测哪台设备"；结果标签紧跟序列号，便于确认本轮结论。
 	tb := newBottomBorder(container.NewHBox(
-		a.startBtn, a.configBtn, a.planSel, layout.NewSpacer(), a.serialLabel, a.resultLabel,
+		a.startBtn, a.configBtn, a.planSel, layout.NewSpacer(), a.workstationLabel, a.serialLabel, a.resultLabel,
 	), theme.ColorNameInputBorder, 1)
 
 	statusBar := newTopBorder(container.NewHBox(a.status, layout.NewSpacer(), a.prog), theme.ColorNameInputBorder, 1)
@@ -960,6 +971,30 @@ func (a *App) setPlanVar(path string) {
 	a.env.Vars["HeatNote"] = hn
 }
 
+// SyncWorkstationLabel 把工具栏的"当前工位"标签同步到 env.Vars
+// ["TEST_WORKSTATION"]。workstation 是启动期一次性获取的，启动后不再变化，
+// 故只在 Attach 后调一次（runGUI 中）。env 尚未 Attach 时显示占位符""。
+// 读 env 用 a.mu 保护，setText 走 fyne.Do 排到主线程，调用方无线程要求。
+func (a *App) SyncWorkstationLabel() {
+	text := ""
+	a.mu.Lock()
+	var ws string
+	if a.env != nil {
+		if v, ok := a.env.Vars["TEST_WORKSTATION"].(string); ok {
+			ws = v
+		}
+	}
+	a.mu.Unlock()
+	if ws != "" {
+		text = ws
+	}
+	fyne.Do(func() {
+		if a.workstationLabel != nil {
+			a.workstationLabel.SetText(text)
+		}
+	})
+}
+
 // syncSerialLabel 把工具栏的"当前测试序列号"标签同步到 env.Vars["HeatNote"]
 // ["serial"] 的最新值。empty=true 时强制清空（不论 env 里有没有值），
 // 用于测试结束后回归占位符"序列号: -"。env 尚未 Attach 时同样显示占位符。
@@ -1072,21 +1107,21 @@ func (a *App) setTestModeFromPlan() {
 // 必须在非主线程（goroutine）中调用；内部用 fyne.Do 回主线程操作 UI。
 func (a *App) queryRecordThenRun(serial string) {
 	a.setTestModeFromPlan()
-	// rec, err := uploader.GetTestRecord(serial)
-	// if err != nil {
-	// 	fyne.Do(func() {
-	// 		dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
-	// 		a.SetStatus("查询测试记录失败")
-	// 	})
-	// 	return
-	// }
-	// // --debug 模式：把查询到的整机测试记录打印到日志供排查
-	// if a.isDebug() {
-	// 	if payload, jerr := json.MarshalIndent(rec, "", "  "); jerr == nil {
-	// 		a.Info("debug 模式，查询到的整机测试记录:\n" + string(payload))
-	// 	}
-	// }
-	// a.applyTestRecord(rec)
+	rec, err := uploader.GetTestRecord(serial)
+	if err != nil {
+		fyne.Do(func() {
+			dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
+			a.SetStatus("查询测试记录失败")
+		})
+		return
+	}
+	// --debug 模式：把查询到的整机测试记录打印到日志供排查
+	if a.isDebug() {
+		if payload, jerr := json.MarshalIndent(rec, "", "  "); jerr == nil {
+			a.Info("debug 模式，查询到的整机测试记录:\n" + string(payload))
+		}
+	}
+	a.applyTestRecord(rec)
 	fyne.Do(func() {
 		a.SetStatus("已找到测试记录，开始测试")
 		a.startRun()
