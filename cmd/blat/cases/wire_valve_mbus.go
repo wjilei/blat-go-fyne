@@ -93,7 +93,7 @@ func (c *WireValveMBusReadMotorCase) Run(ctx context.Context, env *core.Env) err
 		if rerr == nil {
 			retText = ret
 		}
-		env.Log.Info(fmt.Sprintf("状态值: %s, 期望值：%s", retText, c.keyState))
+		env.Log.Info("", fmt.Sprintf("状态值: %s, 期望值：%s", retText, c.keyState))
 		if rerr == nil && ret == c.keyState {
 			// 电机启动完成，做一次"状态保存"校验
 			if err := c.checkStateSaved(ctx, dev, mac, env); err != nil {
@@ -136,14 +136,14 @@ func init() {
 // ctx 取消（Stop 按钮 / 关窗）→ 返回 ctx.Err()。回车默认「是」（参见
 // internal/ui/fyne/app.go yesNoCh 处理，默认焦点在「是」上）。
 func askValveTurned(ctx context.Context, env *core.Env) error {
-	ok, err := env.UI.Confirm(ctx, "请观察阀门是否已转动（电机校准命令已发出）？选「否」将停止并失败")
+	ok, err := env.UI.Confirm(ctx, "请观察阀门是否已转动（电机校准命令已发出）？选「否」将停止并失败", true)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return errors.New("用户确认阀门未转动")
 	}
-	env.Log.Info("已确认阀门转动")
+	env.Log.Info("", "已确认阀门转动")
 	return nil
 }
 
@@ -199,7 +199,7 @@ func _ensureMBUS(ctx context.Context, env *core.Env) (*mbus.Device, error) {
 }
 
 // mbusLogAdapter 把 core.Logger 适配成 mbus.Logger。mbus 包契约的 Logger
-// 要求 Info(args ...any)（core.Logger 只提供 Info(string)），故在调用侧
+// 要求 Info(args ...any)（core.Logger 提供 Info(category, msg)），故在调用侧
 // 包装转发，避免改动 mbus 包。
 type mbusLogAdapter struct {
 	log core.Logger
@@ -208,9 +208,9 @@ type mbusLogAdapter struct {
 func (a mbusLogAdapter) Info(args ...any) {
 	if len(args) == 1 {
 		if s, ok := args[0].(string); ok {
-			a.log.Info(s)
+			a.log.Info("", s)
 			return
 		}
 	}
-	a.log.Info(fmt.Sprint(args...))
+	a.log.Info("", fmt.Sprint(args...))
 }

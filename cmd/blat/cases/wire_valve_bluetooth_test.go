@@ -22,7 +22,7 @@ type fakeUI struct {
 	confirmN   int
 }
 
-func (f *fakeUI) Info(string) {}
+func (f *fakeUI) Info(category, msg string) {}
 
 func (f *fakeUI) Prompt(ctx context.Context, label, def string) (string, error) {
 	return def, nil
@@ -32,7 +32,7 @@ func (f *fakeUI) WaitContinue(ctx context.Context, msg string) error { return ni
 
 func (f *fakeUI) Message(ctx context.Context, msg string, danger bool) error { return nil }
 
-func (f *fakeUI) Confirm(ctx context.Context, msg string) (bool, error) {
+func (f *fakeUI) Confirm(ctx context.Context, msg string, danger bool) (bool, error) {
 	f.mu.Lock()
 	f.confirmMsg = msg
 	f.confirmN++
@@ -50,12 +50,13 @@ func newObserveEnv(ui *fakeUI) *core.Env {
 	}
 }
 
-// fakeLog 满足 core.Logger。
+// fakeLog 满足 core.Logger（Phase 2 A：三方法带 category 参数，测试中
+// 丢弃 category 与消息内容）。
 type fakeLog struct{}
 
-func (fakeLog) Info(string)  {}
-func (fakeLog) Warn(string)  {}
-func (fakeLog) Error(string) {}
+func (fakeLog) Info(category, msg string)  {}
+func (fakeLog) Warn(category, msg string)  {}
+func (fakeLog) Error(category, msg string) {}
 
 // 用户选「是」→ Run 应正常返回，且 Confirm 弹框文案应明确告诉用户
 // 选否会失败（操作员可据此决策）。

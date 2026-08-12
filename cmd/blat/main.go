@@ -202,7 +202,12 @@ func runConsole(plan *config.Plan, vars map[string]any, debug bool) int {
 	rep := report.NewMulti(
 		// Console 模式：写到 DefaultReportDir 目录下带时间戳的 report_<ts>.yml。
 		// release → ~/.blat/；dev（go run）→ "."，便于直接在 cwd 找产物。
-		report.NewYAMLFile(config.DefaultReportDir()),
+		// WithVars 注入 env.Vars 让三段式中的 vars 段带上 HeatNote/Serial*/RfConf；
+		// WithLogfile 注入 Console.test.log 让每个 case 条目拿到窗口切片的 raw log
+		//（case_start/case_stop RUNNER 日志 + case 内日志），与 GUI 模式行为对齐。
+		report.NewYAMLFile(config.DefaultReportDir()).
+			WithVars(env.Vars).
+			WithLogfile(c.Logfile()),
 		report.NewTAP(nil),
 		// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
 		// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。

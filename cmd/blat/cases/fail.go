@@ -26,7 +26,7 @@ func (c *FailCase) Configure(args map[string]any) error {
 }
 
 func (c *FailCase) Run(ctx context.Context, env *core.Env) error {
-	env.Log.Info("[FailCase] running, will fail: " + c.reason)
+	env.Log.Info("", "[FailCase] running, will fail: " + c.reason)
 	return errors.New(c.reason)
 }
 

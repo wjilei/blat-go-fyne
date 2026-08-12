@@ -89,8 +89,8 @@ func TestRunPlan_ReportsEventOrder(t *testing.T) {
 	if rep.summary.OKNum != 3 || rep.summary.FailNum != 0 {
 		t.Errorf("summary = ok:%d fail:%d, want ok:3 fail:0", rep.summary.OKNum, rep.summary.FailNum)
 	}
-	if rep.summary.Result != "pass" {
-		t.Errorf("summary.Result = %q, want pass", rep.summary.Result)
+	if rep.summary.Result != 1 {
+		t.Errorf("summary.Result = %d, want 1", rep.summary.Result)
 	}
 }
 
@@ -112,7 +112,7 @@ func TestRunPlan_FailReportsSummary(t *testing.T) {
 	if len(rep.caseStops) != 1 || rep.caseResults[0] != report.CaseFail {
 		t.Errorf("caseStops/results = %v %v, want fail for seq 1", rep.caseStops, rep.caseResults)
 	}
-	if rep.summary.FailNum != 1 || rep.summary.Result != "fail" {
+	if rep.summary.FailNum != 1 || rep.summary.Result != 0 {
 		t.Errorf("summary = %+v, want failNum 1 result fail", rep.summary)
 	}
 	if rep.summary.Reason == "" {

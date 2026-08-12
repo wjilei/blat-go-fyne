@@ -21,7 +21,7 @@ func TestYAMLReporter(t *testing.T) {
 		Seq: 2, Name: "HelloSuite::SayHello", Title: "招呼",
 		Result: CaseFail, Time: 0.002, Error: "boom",
 	})
-	r.OnPlanStop(Summary{TotalNum: 2, PlanedNum: 2, RunningNum: 2, OKNum: 1, FailNum: 1, Result: "fail"})
+	r.OnPlanStop(Summary{TotalNum: 2, PlanedNum: 2, RunningNum: 0, OKNum: 1, FailNum: 1, Result: 0, Reason: "boom"})
 
 	out := buf.String()
 	for _, want := range []string{
@@ -35,7 +35,7 @@ func TestYAMLReporter(t *testing.T) {
 		"error: boom",
 		"summary:",
 		"test_fail_num: 1",
-		"test_result: fail",
+		"test_result: 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("YAML output missing %q in:\n%s", want, out)
@@ -48,7 +48,7 @@ func TestYAMLReporter_FileMode(t *testing.T) {
 	r := NewYAMLFile(dir)
 	r.OnPlanStart(1, time.Now())
 	r.OnCaseStop(1, CaseReport{Seq: 1, Name: "A::B", Result: CaseOK})
-	r.OnPlanStop(Summary{TotalNum: 1, OKNum: 1, Result: "pass"})
+	r.OnPlanStop(Summary{TotalNum: 1, OKNum: 1, Result: 1})
 
 	matches, err := filepath.Glob(filepath.Join(dir, "report_*.yml"))
 	if err != nil {
@@ -76,7 +76,7 @@ func TestYAMLReporter_PathMode(t *testing.T) {
 	r1 := NewYAMLPath(path)
 	r1.OnPlanStart(1, time.Now())
 	r1.OnCaseStop(1, CaseReport{Seq: 1, Name: "A::B", Result: CaseOK})
-	r1.OnPlanStop(Summary{TotalNum: 1, OKNum: 1, Result: "pass"})
+	r1.OnPlanStop(Summary{TotalNum: 1, OKNum: 1, Result: 1})
 
 	first, err := os.ReadFile(path)
 	if err != nil {
@@ -91,7 +91,7 @@ func TestYAMLReporter_PathMode(t *testing.T) {
 	r2.OnPlanStart(2, time.Now())
 	r2.OnCaseStop(1, CaseReport{Seq: 1, Name: "X::Y", Result: CaseOK})
 	r2.OnCaseStop(2, CaseReport{Seq: 2, Name: "X::Z", Result: CaseOK})
-	r2.OnPlanStop(Summary{TotalNum: 2, OKNum: 2, Result: "pass"})
+	r2.OnPlanStop(Summary{TotalNum: 2, OKNum: 2, Result: 1})
 
 	second, err := os.ReadFile(path)
 	if err != nil {
@@ -113,7 +113,7 @@ func TestTAPReporter(t *testing.T) {
 	r.OnCaseStop(1, CaseReport{Seq: 1, Name: "HelloSuite::SayHello", Title: "SayHello", Result: CaseOK})
 	r.OnCaseStop(2, CaseReport{Seq: 2, Name: "HelloSuite::SayHello", Title: "SayHello", Result: CaseOK})
 	r.OnCaseStop(3, CaseReport{Seq: 3, Name: "SomeCase", Result: CaseFail, Error: "expected X, got Y"})
-	r.OnPlanStop(Summary{FailNum: 1, Result: "fail"})
+	r.OnPlanStop(Summary{FailNum: 1, Result: 0})
 
 	want := `TAP version 13
 1..3
@@ -135,7 +135,7 @@ func TestTAPReporter_PassOnly(t *testing.T) {
 	r := NewTAP(&buf)
 	r.OnPlanStart(1, time.Now())
 	r.OnCaseStop(1, CaseReport{Seq: 1, Name: "A::B", Result: CaseOK})
-	r.OnPlanStop(Summary{OKNum: 1, Result: "pass"})
+	r.OnPlanStop(Summary{OKNum: 1, Result: 1})
 
 	if strings.Contains(buf.String(), "Bail out!") {
 		t.Errorf("unexpected Bail out for a passing plan:\n%s", buf.String())
@@ -165,7 +165,7 @@ func TestMultiReporter(t *testing.T) {
 	m.OnPlanStart(2, time.Now())
 	m.OnCaseStart(1, CaseReport{Seq: 1, Result: CaseRunning})
 	m.OnCaseStop(1, CaseReport{Seq: 1, Result: CaseOK})
-	m.OnPlanStop(Summary{Result: "pass"})
+	m.OnPlanStop(Summary{Result: 1})
 
 	for i, s := range subs {
 		if s.planStarts != 1 {

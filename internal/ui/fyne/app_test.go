@@ -16,33 +16,33 @@ func TestPlanResultLabel(t *testing.T) {
 	}{
 		{
 			name:     "全部通过",
-			sum:      report.Summary{TotalNum: 3, OKNum: 3, Result: "pass"},
+			sum:      report.Summary{TotalNum: 3, OKNum: 3, Result: 1},
 			wantText: "成功",
 			wantOK:   true,
 		},
 		{
 			name:     "有失败",
-			sum:      report.Summary{TotalNum: 3, OKNum: 2, FailNum: 1, Result: "fail"},
+			sum:      report.Summary{TotalNum: 3, OKNum: 2, FailNum: 1, Result: 0},
 			wantText: "失败",
 			wantOK:   false,
 		},
 		{
 			name:      "用户取消",
-			sum:       report.Summary{TotalNum: 3, OKNum: 1, FailNum: 0, Result: "pass"},
+			sum:       report.Summary{TotalNum: 3, OKNum: 1, FailNum: 0, Result: 1},
 			cancelled: true,
 			wantText:  "已取消",
 			wantOK:    false,
 		},
 		{
 			name:     "用户取消且原本有失败",
-			sum:      report.Summary{TotalNum: 3, OKNum: 1, FailNum: 1, Result: "fail"},
+			sum:      report.Summary{TotalNum: 3, OKNum: 1, FailNum: 1, Result: 0},
 			cancelled: true,
 			wantText:  "已取消",
 			wantOK:    false,
 		},
 		{
 			name:     "总数为 0 也按通过处理（无失败即视为成功）",
-			sum:      report.Summary{TotalNum: 0, OKNum: 0, Result: "pass"},
+			sum:      report.Summary{TotalNum: 0, OKNum: 0, Result: 1},
 			wantText: "成功",
 			wantOK:   true,
 		},

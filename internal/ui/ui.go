@@ -67,16 +67,18 @@ func NewConsoleWith(in io.Reader, promptOut, logOut io.Writer) *Console {
 	}
 }
 
-func (c *Console) Info(s string)  { c.logLine("info", s) }
-func (c *Console) Warn(s string)  { c.logLine("warn", s) }
-func (c *Console) Error(s string) { c.logLine("error", s) }
+// Info/Warn/Error 实现 core.Logger（Phase 2 A：category 透传，空串表示
+// 无分类）。category 最终由 logfile 写进文件行（对齐 LogAnyConf 的 %c）。
+func (c *Console) Info(category, s string)  { c.logLine("info", category, s) }
+func (c *Console) Warn(category, s string)  { c.logLine("warn", category, s) }
+func (c *Console) Error(category, s string) { c.logLine("error", category, s) }
 
-func (c *Console) logLine(level, s string) {
+func (c *Console) logLine(level, category, s string) {
 	line := "[" + strings.ToUpper(level) + "] " + s
 	fmt.Fprintln(c.log, line)
 	if c.file != nil {
 		// 文件行格式与 GUI 一致（15:04:05,000 LEVEL CATEGORY - msg）。
-		_ = c.file.WriteLine(level, "CONSOLE", s)
+		_ = c.file.WriteLine(level, category, s)
 	}
 	c.mu.Lock()
 	c.buf = append(c.buf, line)
@@ -84,6 +86,15 @@ func (c *Console) logLine(level, s string) {
 		c.buf = c.buf[len(c.buf)-c.cap:]
 	}
 	c.mu.Unlock()
+}
+
+// Logfile 返回 Console 持有的 *logfile.FileLogger（NewConsole 创建、test.log）；
+// NewConsoleWith 等测试构造里为 nil。供装配阶段把同一个 logfile 注入到
+// report.YAMLReporter 的 WithLogfile，让 Console 模式的 report.yml 也能
+// 拿到每条 case 的窗口切片日志（GUI 模式由 fyneui.App 直接持有 logfile，
+// Console 模式此前未对外暴露）。
+func (c *Console) Logfile() *logfile.FileLogger {
+	return c.file
 }
 
 // SnapshotLog 返回当前全部日志行（按时间顺序，每行以换行结尾）。
@@ -146,16 +157,16 @@ func (c *Console) WaitContinue(ctx context.Context, msg string) error {
 // 打印体现红色语义）。
 func (c *Console) Message(ctx context.Context, msg string, danger bool) error {
 	if danger {
-		c.Error(msg)
+		c.Error("", msg)
 	} else {
-		c.Info(msg)
+		c.Info("", msg)
 	}
 	return c.WaitContinue(ctx, msg)
 }
 
 // Confirm 在 stdin 上读取一行 y/n 解析为 bool。空行视作"否"。
 // 同时支持中文"是/否"。ctx 取消时返回 ctx.Err()。
-func (c *Console) Confirm(ctx context.Context, msg string) (bool, error) {
+func (c *Console) Confirm(ctx context.Context, msg string, danger bool) (bool, error) {
 	fmt.Fprintf(c.w, "%s [y/N]: ", msg)
 	ch := make(chan struct {
 		val bool

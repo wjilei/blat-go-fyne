@@ -38,7 +38,6 @@ package fyneui
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"image/color"
 	"os"
@@ -134,14 +133,16 @@ type promptReply struct {
 }
 
 type confirmReq struct {
-	msg   string
-	reply chan struct{}
+	msg    string
+	danger bool
+	reply  chan struct{}
 }
 
 // yesNoReq 是 Confirm 通道的请求：是/否双按钮弹框，reply 携带用户选择。
 type yesNoReq struct {
-	msg   string
-	reply chan bool
+	msg    string
+	danger bool
+	reply  chan bool
 }
 
 type messageReq struct {
@@ -289,18 +290,18 @@ func New(title string) *App {
 		_, logOff, logGen, _ = logf.TailFrom(0, 0)
 	}
 	a := &App{
-		fa:        fa,
-		win:       win,
-		logf:      logf,
-		logOff:    logOff,
-		logGen:    logGen,
-		varsFile:  "", // 由 main 在启动时通过 SetVarsFile 注入，路径默认 ~/.blat/env.yml
+		fa:         fa,
+		win:        win,
+		logf:       logf,
+		logOff:     logOff,
+		logGen:     logGen,
+		varsFile:   "", // 由 main 在启动时通过 SetVarsFile 注入，路径默认 ~/.blat/env.yml
 		reportFile: "", // 由 main 在启动时通过 SetReportFile 注入，空时回退 config.DefaultReportPath()
-		promptCh:  make(chan promptReq, 8),
-		confirmCh: make(chan confirmReq, 8),
-		yesNoCh:   make(chan yesNoReq, 8),
-		messageCh: make(chan messageReq, 8),
-		shutdown:  make(chan struct{}),
+		promptCh:   make(chan promptReq, 8),
+		confirmCh:  make(chan confirmReq, 8),
+		yesNoCh:    make(chan yesNoReq, 8),
+		messageCh:  make(chan messageReq, 8),
+		shutdown:   make(chan struct{}),
 	}
 	a.build()
 	win.SetOnClosed(func() {
@@ -650,6 +651,9 @@ func (a *App) startPump() {
 					okKB := newKeyButton(okBtn)
 					title := widget.NewLabelWithStyle("请继续", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 					msgLabel := widget.NewLabel(req.msg)
+					if req.danger {
+						msgLabel.Importance = widget.DangerImportance
+					}
 					buttonRow := container.NewHBox(layout.NewSpacer(), cancelBtn, okKB)
 					content := container.NewVBox(title, widget.NewSeparator(), msgLabel, buttonRow)
 					padded := container.New(layout.NewPaddedLayout(), content)
@@ -681,6 +685,9 @@ func (a *App) startPump() {
 					noKB := newKeyButton(noBtn)
 					title := widget.NewLabelWithStyle("请选择", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 					msgLabel := widget.NewLabel(req.msg)
+					if req.danger {
+						msgLabel.Importance = widget.DangerImportance
+					}
 					buttonRow := container.NewHBox(layout.NewSpacer(), noKB, yesKB)
 					content := container.NewVBox(title, widget.NewSeparator(), msgLabel, buttonRow)
 					padded := container.New(layout.NewPaddedLayout(), content)
@@ -837,7 +844,7 @@ func (a *App) loadPlan() {
 	a.ResetTiming()
 	fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil {
-			a.Error("open plan: " + err.Error())
+			a.Error("", "open plan: "+err.Error())
 			return
 		}
 		if reader == nil {
@@ -847,7 +854,7 @@ func (a *App) loadPlan() {
 		path := reader.URI().Path()
 		plan, err := config.LoadPlan(path)
 		if err != nil {
-			a.Error(err.Error())
+			a.Error("", err.Error())
 			return
 		}
 		a.mu.Lock()
@@ -872,7 +879,7 @@ func (a *App) loadPlan() {
 func (a *App) stopIfRunning() {
 	if a.running() {
 		a.StopRun()
-		a.Warn("已停止当前运行，请重新选择 plan")
+		a.Warn("", "已停止当前运行，请重新选择 plan")
 	}
 }
 
@@ -913,7 +920,7 @@ func (a *App) onPlanSelected(name string) {
 	}
 	path := a.planPath(name)
 	if path == "" {
-		a.Warn("未知计划: " + name)
+		a.Warn("", "未知计划: "+name)
 		return
 	}
 	a.loadPlanByPath(path)
@@ -938,7 +945,7 @@ func (a *App) loadPlanByPath(path string) {
 	a.ResetTiming()
 	plan, err := config.LoadPlan(path)
 	if err != nil {
-		a.Error(err.Error())
+		a.Error("", err.Error())
 		return
 	}
 	a.mu.Lock()
@@ -1145,21 +1152,18 @@ func (a *App) setTestModeFromPlan() {
 // 必须在非主线程（goroutine）中调用；内部用 fyne.Do 回主线程操作 UI。
 func (a *App) queryRecordThenRun(serial string) {
 	a.setTestModeFromPlan()
-	rec, err := uploader.GetTestRecord(serial)
-	if err != nil {
-		fyne.Do(func() {
-			dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
-			a.SetStatus("查询测试记录失败")
-		})
-		return
-	}
-	// --debug 模式：把查询到的整机测试记录打印到日志供排查
-	if a.isDebug() {
-		if payload, jerr := json.MarshalIndent(rec, "", "  "); jerr == nil {
-			a.Info("debug 模式，查询到的整机测试记录:\n" + string(payload))
+	if !a.isDebug() {
+		rec, err := uploader.GetTestRecord(serial)
+		if err != nil {
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("查询测试记录失败: %w", err), a.win)
+				a.SetStatus("查询测试记录失败")
+			})
+			return
 		}
+
+		a.applyTestRecord(rec)
 	}
-	a.applyTestRecord(rec)
 	fyne.Do(func() {
 		a.SetStatus("已找到测试记录，开始测试")
 		a.startRun()
@@ -1227,7 +1231,7 @@ func (a *App) promptConfig() {
 		}
 		picked := sel.Selected
 		if picked == "" {
-			a.Warn("未选择串口")
+			a.Warn("", "未选择串口")
 			return
 		}
 		a.applyMBUSPort(picked)
@@ -1241,12 +1245,12 @@ func (a *App) applyMBUSPort(port string) {
 	a.mu.Lock()
 	if a.env == nil {
 		a.mu.Unlock()
-		a.Warn("env 尚未初始化，无法保存配置")
+		a.Warn("", "env 尚未初始化，无法保存配置")
 		return
 	}
 	if a.varsFile == "" {
 		a.mu.Unlock()
-		a.Warn("varsFile 尚未初始化（main 未注入），无法保存配置")
+		a.Warn("", "varsFile 尚未初始化（main 未注入），无法保存配置")
 		return
 	}
 	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
@@ -1281,7 +1285,7 @@ func (a *App) applyMBUSPort(port string) {
 		dialog.ShowError(fmt.Errorf("保存 %s 失败: %w", path, err), a.win)
 		return
 	}
-	a.Info("MBUS 串口已保存: " + port)
+	a.Info("", "MBUS 串口已保存: "+port)
 }
 
 // serialFormatRe 序列号格式：可选 W 开头（不区分大小写）后接 12 位数字。
@@ -1394,11 +1398,11 @@ func (a *App) startRun() {
 	plan, env, reg := a.plan, a.env, a.reg
 	a.mu.Unlock()
 	if plan == nil || env == nil || reg == nil {
-		a.Warn("没有可运行的 plan，请先加载")
+		a.Warn("", "没有可运行的 plan，请先加载")
 		return
 	}
 	if len(plan.Cases) == 0 {
-		a.Warn("plan 为空")
+		a.Warn("", "plan 为空")
 		return
 	}
 	a.startBtn.SetIcon(theme.MediaStopIcon())
@@ -1414,7 +1418,15 @@ func (a *App) startRun() {
 		pr := runtime.NewPlanRunner(reg)
 		adp := &guiAdapter{gui: a} // 留出引用以便退出前标记取消态
 		rep := report.NewMulti(
-			report.NewYAMLPath(a.reportFileOrDefault()), // 固定文件名 + 每次开始时清空
+			// 固定文件名 + 每次开始时清空。WithLogfile 注入 a.logf 让每个 case
+			// 条目的 log 块字段拿到窗口切片（case_start/case_stop RUNNER 日志 +
+			// case 内日志），对齐 Console 模式 cmd/blat/main.go:runConsole 装配；
+			// WithVars 注入 env.Vars 让 env 段带上 HeatNote/Serial*/RfConf。
+			// 不传则 GUI 模式 report.yml 每个 case 的 log 字段会 omitempty 缺失，
+			// 与目标 Perl report.yml 结构不一致。
+			report.NewYAMLPath(a.reportFileOrDefault()).
+				WithLogfile(a.logf).
+				WithVars(env.Vars),
 			report.NewTAP(&tapWriter{a: a}),             // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
 			adp,
 			// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
@@ -1444,7 +1456,7 @@ func (a *App) startRun() {
 		// 状态文字 / 按钮 / 进度条 收尾统一交给 guiAdapter.OnPlanStop。
 		// 这里只记录 err 日志，避免与 reporter 双写。
 		if err != nil {
-			a.Error(err.Error())
+			a.Error("", err.Error())
 		}
 	}()
 }
@@ -1505,7 +1517,7 @@ func (g *guiAdapter) OnPlanStop(sum report.Summary) {
 	if g.cancelled {
 		status = "已取消"
 	}
-	g.gui.Info(status)
+	g.gui.Info("", status)
 
 	fyne.Do(func() {
 		g.gui.StopTicker() // 先关 ticker，冻结耗时；再做其他收尾
@@ -1713,9 +1725,11 @@ func (a *App) SetProgress(v float64) {
 
 // ---- log (ring buffer) ----
 
-func (a *App) Info(s string)  { a.appendLog("info", "APP", s) }
-func (a *App) Warn(s string)  { a.appendLog("warn", "APP", s) }
-func (a *App) Error(s string) { a.appendLog("error", "APP", s) }
+// Info/Warn/Error 实现 core.Logger（Phase 2 A：category 透传，空串表示
+// 无分类）。category 最终由 logfile 写进文件行（对齐 LogAnyConf 的 %c）。
+func (a *App) Info(category, s string)  { a.appendLog("info", category, s) }
+func (a *App) Warn(category, s string)  { a.appendLog("warn", category, s) }
+func (a *App) Error(category, s string) { a.appendLog("error", category, s) }
 
 // Debug appends a gray log line tagged with the current category (see
 // SetCategory). It is an extension of core.Logger.
@@ -1917,7 +1931,7 @@ func (a *App) Message(ctx context.Context, msg string, danger bool) error {
 // 返回 (true, nil) 表示用户选"是"，(false, nil) 表示选"否"。
 // 关窗走 a.shutdown 通道返回 error（"ui shutdown"），便于调用方
 // 区分主动取消与正常"否"。
-func (a *App) Confirm(ctx context.Context, msg string) (bool, error) {
+func (a *App) Confirm(ctx context.Context, msg string, danger bool) (bool, error) {
 	req := yesNoReq{msg: msg, reply: make(chan bool, 1)}
 	select {
 	case a.yesNoCh <- req:

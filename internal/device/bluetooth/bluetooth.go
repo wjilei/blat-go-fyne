@@ -64,8 +64,11 @@ var (
 
 // Logger 是 bluetooth 包可选的日志输出接口（与 core.Logger 的 Info 兼容，
 // 不直接依赖 core 避免引入包级耦合）。nil 时静默跳过日志。
+//
+// Phase 2 A：跟随 core.Logger 升级为 (category, msg)。SetLogger 通常收到
+// env.Log（core.Logger 接口值），签名不一致会破坏透传，故必须同步。
 type Logger interface {
-	Info(string)
+	Info(category, msg string)
 }
 
 // Status mirrors the Perl BluetoothRead result fields.
@@ -217,13 +220,14 @@ func (d *Device) SetLogger(l Logger) {
 	d.logger = l
 }
 
-// logInfo 输出一条日志；logger 为 nil 时静默跳过。
+// logInfo 输出一条日志；logger 为 nil 时静默跳过。蓝牙设备日志不带分类
+// （空 category），保持与 case 端一致。
 func (d *Device) logInfo(msg string) {
 	d.mu.Lock()
 	l := d.logger
 	d.mu.Unlock()
 	if l != nil {
-		l.Info(msg)
+		l.Info("", msg)
 	}
 }
 

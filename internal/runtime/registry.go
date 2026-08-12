@@ -10,11 +10,14 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"blat/internal/config"
 	"blat/internal/core"
 	"blat/internal/report"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Factory builds a fresh Case instance for one execution.
@@ -115,6 +118,7 @@ func (p *PlanRunner) RunPlan(
 						Title:  item.Title,
 						Result: report.CaseFail,
 						Error:  err.Error(),
+						Extra:  cleanCaseArgs(item),
 					})
 				}
 				finish(item.Title)
@@ -131,6 +135,7 @@ func (p *PlanRunner) RunPlan(
 							Title:  item.Title,
 							Result: report.CaseFail,
 							Error:  err.Error(),
+							Extra:  cleanCaseArgs(item),
 						})
 					}
 					finish(item.Title)
@@ -143,7 +148,20 @@ func (p *PlanRunner) RunPlan(
 					Name:   item.Name,
 					Title:  item.Title,
 					Result: report.CaseRunning,
+					Extra:  cleanCaseArgs(item),
 				})
+			}
+			// case_start 日志（对齐 Perl Runner.pm:119：Log::Any category
+			// RUNNER 写 "case_start <name> " . yaml_dump(\%tmp_arg)，plan
+			// args 以多行 YAML 追加到行尾）。args 为空时只输出 <name>，
+			// 不带尾随空格。env.Log 可能为 nil（纯测试构造的 Env 常见），
+			// 需 guard。
+			if env.Log != nil {
+				msg := "case_start " + item.Name
+				if args := dumpArgsForLog(item.Args); args != "" {
+					msg += " " + args
+				}
+				env.Log.Info("RUNNER", msg)
 			}
 			t0 := time.Now()
 			runErr := c.Run(ctx, env)
@@ -152,6 +170,7 @@ func (p *PlanRunner) RunPlan(
 				Name:  item.Name,
 				Title: item.Title,
 				Time:  time.Since(t0).Seconds(),
+				Extra: cleanCaseArgs(item),
 			}
 			if runErr == nil {
 				okNum++
@@ -160,6 +179,16 @@ func (p *PlanRunner) RunPlan(
 				failNum++
 				cr.Result = report.CaseFail
 				cr.Error = runErr.Error()
+			}
+			// case_stop 日志（对齐 Perl Runner.pm:161：
+			// "case_stop <name> <ok|fail> <time>"，time 为 %.2f 秒，category
+			// RUNNER 与 case_start 一致，供报告端按 case 窗口切片日志）。
+			if env.Log != nil {
+				resultStr := "ok"
+				if runErr != nil {
+					resultStr = "fail"
+				}
+				env.Log.Info("RUNNER", fmt.Sprintf("case_stop %s %s %.2f", item.Name, resultStr, time.Since(t0).Seconds()))
 			}
 			if rep != nil {
 				rep.OnCaseStop(testNo, cr)
@@ -174,23 +203,63 @@ func (p *PlanRunner) RunPlan(
 	return nil
 }
 
-// buildSummary derives the plan Summary from counters and the run start
-// time. StartTime/StopTime use RFC3339 so timestamps are unambiguous.
+// dumpArgsForLog 把 plan args 序列化为 YAML 多行文本，追加在 case_start
+// 日志行 `case_start <name> ` 之后（对齐 Perl Runner.pm:119 的
+// yaml_dump(\%tmp_arg)）。args 为空（或序列化失败）时返回空串，调用方
+// 不追加空格。yaml.v3 对 map 键按字节序排序输出，比 Perl hash 更确定。
+func dumpArgsForLog(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	data, err := yaml.Marshal(args)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(data), "\n")
+}
+
+// cleanCaseArgs 深拷贝 plan item 的自定义 args 为 CaseReport.Extra，并按
+// Perl DisplayRole.pm:69-88 app_reports 规则删冗余：desc == title 时 desc
+// 不进入 case 条目（title 保留在独立字段）。返回 nil 表示无自定义键
+// （YAML `,inline` 不输出任何东西）。counts/parallel/case_seq 是 CaseItem
+// 的独立字段、不在 Args 里，天然不进 Extra。
+func cleanCaseArgs(item config.CaseItem) map[string]any {
+	extra := make(map[string]any, len(item.Args))
+	for k, v := range item.Args {
+		extra[k] = v
+	}
+	if item.Desc == item.Title {
+		delete(extra, "desc")
+	}
+	if len(extra) == 0 {
+		return nil
+	}
+	return extra
+}
+
+// buildSummary derives the plan Summary from counters and the run start// time. StartTime/StopTime use RFC3339 so timestamps are unambiguous.
+//
+// Result 是 int（1/0），与 Perl ConfigRole 一致；reason 为空表示成功,
+// 此时 Result=1, Reason="ok"；首个失败用例的 title 写入 Reason 并将 Result 置 0。
+// TotalTime 仿 Perl DisplayRole test_stop: sprintf("%.2f", elapsed sec)。
 func buildSummary(total, okNum, failNum int, start time.Time, reason string) report.Summary {
 	sum := report.Summary{
 		TotalNum:   total,
 		PlanedNum:  total,
-		RunningNum: total,
+		RunningNum: 0,
 		OKNum:      okNum,
 		FailNum:    failNum,
-		Result:     "pass",
+		Result:     1,
+		Reason:     "ok",
+		TotalTime:  time.Since(start).Seconds(),
 		StartTime:  start.Format(time.RFC3339),
 		StopTime:   time.Now().Format(time.RFC3339),
-		Duration:   time.Since(start).Seconds(),
 	}
 	if failNum > 0 || reason != "" {
-		sum.Result = "fail"
-		sum.Reason = reason
+		sum.Result = 0
+		if reason != "" {
+			sum.Reason = reason
+		}
 	}
 	return sum
 }

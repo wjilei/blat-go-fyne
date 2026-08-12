@@ -24,7 +24,7 @@ func Run(ctx context.Context, app App, env *Env) error {
 	}
 	r := NewRunner()
 	for _, s := range app.Suites() {
-		env.Log.Info("== suite: " + s.Name())
+		env.Log.Info("", "== suite: " + s.Name())
 		if err := r.Run(ctx, s, env); err != nil {
 			return err
 		}

@@ -23,7 +23,7 @@ func (c *SayByeCase) Configure(args map[string]any) error {
 }
 
 func (c *SayByeCase) Run(ctx context.Context, env *core.Env) error {
-	env.Log.Info("[SayBye] 准备告别 ...")
+	env.Log.Info("", "[SayBye] 准备告别 ...")
 	def := c.who
 	if def == "" {
 		def = "guest"
@@ -32,7 +32,7 @@ func (c *SayByeCase) Run(ctx context.Context, env *core.Env) error {
 	if err != nil {
 		return err
 	}
-	env.Log.Info("Bye, " + name + "!")
+	env.Log.Info("", "Bye, " + name + "!")
 	return env.UI.WaitContinue(ctx, "按回车继续")
 }
 

@@ -22,12 +22,12 @@ func (c *SayHelloCase) Configure(args map[string]any) error {
 }
 
 func (c *SayHelloCase) Run(ctx context.Context, env *core.Env) error {
-	env.UI.Info("Hello, " + c.who)
+	env.UI.Info("", "Hello, "+c.who)
 	name, err := env.UI.Prompt(ctx, "Your name", "guest")
 	if err != nil {
 		return err
 	}
-	env.UI.Info("Welcome, " + name)
+	env.UI.Info("", "Welcome, "+name)
 	return env.UI.WaitContinue(ctx, "done")
 }
 

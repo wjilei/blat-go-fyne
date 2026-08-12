@@ -24,7 +24,7 @@ func (r *Runner) Run(ctx context.Context, s Suite, env *Env) error {
 		if c == nil {
 			return fmt.Errorf("suite %s: nil case", s.Name())
 		}
-		env.Log.Info(">>> " + c.Name())
+		env.Log.Info("", ">>> " + c.Name())
 		if err := c.Run(ctx, env); err != nil {
 			return fmt.Errorf("case %s failed: %w", c.Name(), err)
 		}

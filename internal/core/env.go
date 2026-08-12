@@ -16,10 +16,15 @@ import (
 
 // Logger is a minimal log interface so the framework does not depend on a
 // concrete logger library.
+//
+// Phase 2 A：三个方法都带 category 参数，对齐 Perl LogAnyConf.pm 的
+// `%c`（category）字段。cat=="" 表示不带分类（case 端旧用法沿用，调用侧
+// 一律写 Info("", ...)）；cat!="" 表示显式分类（如 Runner 的 "RUNNER"）。
+// Go 无方法重载，接口升级一次到位，所有实现同步改签名。
 type Logger interface {
-	Info(string)
-	Warn(string)
-	Error(string)
+	Info(category, msg string)
+	Warn(category, msg string)
+	Error(category, msg string)
 }
 
 // UI is the minimal UI hook interface. Concrete implementations may be a
@@ -29,8 +34,12 @@ type Logger interface {
 // can cancel a blocking dialog (e.g. when the user presses the toolbar Stop
 // button or the window is closed). Implementations MUST honor the context
 // and return ctx.Err() when it is done.
+//
+// Info 与 Logger.Info 同名同签名（Phase 2 A 起带 category 参数），使
+// Console/Fyne App 一个方法同时满足 UI 与 Logger 两个接口；Go 不允许同一
+// 类型上有两个同名异参方法，UI 接口必须跟随 Logger 一起升级。
 type UI interface {
-	Info(string)
+	Info(category, msg string)
 	Prompt(ctx context.Context, label, def string) (string, error)
 	WaitContinue(ctx context.Context, msg string) error
 	// Message 弹出一个只有"确定"按钮的消息框（无取消）。danger 为 true 时
@@ -39,7 +48,7 @@ type UI interface {
 	// Confirm 弹出一个"是/否"选择框，返回用户的选择。
 	// true=是（继续），false=否（用例应主动失败）。GUI 实现通常对应
 	// dialog.NewConfirm；Console 实现通过 stdin 输入 y/n 解析。
-	Confirm(ctx context.Context, msg string) (bool, error)
+	Confirm(ctx context.Context, msg string, danger bool) (bool, error)
 }
 
 // Env is the shared context passed through every Case at run time. It carries
