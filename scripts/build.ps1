@@ -116,6 +116,10 @@ if (-not (Test-Path $ExePath)) {
 
 # -------- 2. NSIS --------
 if (-not $SkipInstaller) {
+    Write-Host "[build] Cleaning old installers in $DistDir"
+    if (Test-Path $DistDir) {
+        Get-ChildItem -Path $DistDir -Filter "*.exe" -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
     Write-Host "[build] Preparing NSIS stage dir"
     $stageConfs = Join-Path $StageDir "confs"
     if (Test-Path $StageDir) {
