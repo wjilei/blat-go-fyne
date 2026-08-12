@@ -43,6 +43,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -391,8 +392,8 @@ func (a *App) build() {
 	a.status = widget.NewLabel("就绪")
 	a.prog = widget.NewProgressBar()
 
-	// 单行模板：图标 + 标题 + 弹性间隔 + 状态标签。
-	// update 回调依赖此结构顺序，索引 0/1/3 是固定位。
+	// 单行模板：图标 + 标题 + 状态标签。
+	// update 回调依赖此结构顺序，索引 0/1/2 是固定位。
 	// ⚠ create 必须每次返回新对象：Fyne 按可见行数创建多个 cell，
 	// 共享同一个 CanvasObject 会让所有行显示为最后一次 update 的内容。
 	a.tree = widget.NewTree(
@@ -421,8 +422,7 @@ func (a *App) build() {
 			return container.NewHBox(
 				widget.NewIcon(theme.DocumentIcon()), // [0] 图标
 				widget.NewLabel("template"),          // [1] 标题
-				layout.NewSpacer(),                   // [2] 占位
-				widget.NewLabel(""),                  // [3] 状态
+				widget.NewLabel(""),                  // [2] 状态
 			)
 		},
 		// update: 按 uid 渲染。
@@ -430,7 +430,7 @@ func (a *App) build() {
 			c := o.(*fyne.Container)
 			ic := c.Objects[0].(*widget.Icon)
 			lb := c.Objects[1].(*widget.Label)
-			st := c.Objects[3].(*widget.Label)
+			st := c.Objects[2].(*widget.Label)
 
 			switch uid {
 			case nodePlan:
@@ -1124,13 +1124,7 @@ func (a *App) promptConfig() {
 
 	// 当前值若不在枚举结果里（设备被拔了），把它插到下拉首位以便显示。
 	if current != "" {
-		found := false
-		for _, p := range ports {
-			if p == current {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(ports, current)
 		if !found {
 			ports = append([]string{current}, ports...)
 		}
@@ -1423,10 +1417,7 @@ func (g *guiAdapter) OnPlanStop(sum report.Summary) {
 	// 2. 默认 UI 收尾
 	total := sum.TotalNum
 	ok, fail := sum.OKNum, sum.FailNum
-	skipped := total - ok - fail
-	if skipped < 0 {
-		skipped = 0
-	}
+	skipped := max(total-ok-fail, 0)
 	status := fmt.Sprintf("完成: %d/%d 通过", ok, total)
 	if fail > 0 {
 		status = fmt.Sprintf("完成: %d 通过, %d 失败, %d 跳过", ok, fail, skipped)
@@ -1644,8 +1635,14 @@ func (a *App) SetProgress(v float64) {
 
 // Info/Warn/Error 实现 core.Logger（Phase 2 A：category 透传，空串表示
 // 无分类）。category 最终由 logfile 写进文件行（对齐 LogAnyConf 的 %c）。
-func (a *App) Info(category, s string)  { a.appendLog("info", category, s) }
-func (a *App) Warn(category, s string)  { a.appendLog("warn", category, s) }
+
+// Info ...
+func (a *App) Info(category, s string) { a.appendLog("info", category, s) }
+
+// Warn ...
+func (a *App) Warn(category, s string) { a.appendLog("warn", category, s) }
+
+// Error ...
 func (a *App) Error(category, s string) { a.appendLog("error", category, s) }
 
 // Debug appends a gray log line tagged with the current category (see
@@ -1719,7 +1716,7 @@ func (a *App) refreshLog() {
 				cur.Reset()
 			}
 		}
-		for _, line := range strings.Split(text, "\n") {
+		for line := range strings.SplitSeq(text, "\n") {
 			line = strings.TrimRight(line, "\r")
 			if line == "" {
 				continue
