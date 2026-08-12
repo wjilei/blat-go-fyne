@@ -28,7 +28,7 @@
 //
 // The toolbar Load/Start buttons own the plan lifecycle: Load reloads the
 // plan into the case tree, Start launches the runner goroutine (see
-// loadPlan / startRun).
+// startRun).
 //
 // All widget creation happens on the Fyne main thread (fyne.Do). The
 // runner goroutine and the pump goroutine only touch the log ring buffer
@@ -64,7 +64,6 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -322,50 +321,6 @@ func New(title string) *App {
 // 不能直接赋——必须走 Theme().Color(name, variant)。
 func themeColor(name fyne.ThemeColorName) color.Color {
 	return fyne.CurrentApp().Settings().Theme().Color(name, fyne.CurrentApp().Settings().ThemeVariant())
-}
-
-// borderLayout 把第一个对象当 content 排版，第二个对象（通常是画线
-// 的 canvas.Rectangle）铺满整个容器。pad 计入 MinSize。
-type borderLayout struct {
-	padTop, padBottom, padLeft, padRight float32
-}
-
-func (b borderLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
-	if len(objs) < 2 {
-		return
-	}
-	objs[0].Move(fyne.NewPos(b.padLeft, b.padTop))
-	objs[0].Resize(fyne.NewSize(
-		size.Width-b.padLeft-b.padRight,
-		size.Height-b.padTop-b.padBottom,
-	))
-	objs[1].Resize(size)
-}
-
-func (b borderLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
-	if len(objs) == 0 {
-		return fyne.NewSize(0, 0)
-	}
-	inner := objs[0].MinSize()
-	return fyne.NewSize(
-		inner.Width+b.padLeft+b.padRight,
-		inner.Height+b.padTop+b.padBottom,
-	)
-}
-
-// newBordered 给任意 CanvasObject 包一层指定颜色/线宽的矩形边框。
-// 颜色用 fyne.ThemeColorName，浅色/深色主题自动适配。
-func newBordered(content fyne.CanvasObject, lineColor fyne.ThemeColorName, lineWidth float32) *fyne.Container {
-	rect := canvas.NewRectangle(color.Transparent)
-	rect.StrokeColor = themeColor(lineColor)
-	rect.StrokeWidth = lineWidth
-	return container.New(
-		borderLayout{
-			padLeft: lineWidth, padRight: lineWidth,
-			padTop: lineWidth, padBottom: lineWidth,
-		},
-		content, rect,
-	)
 }
 
 // newBottomBorder 只在 content 下方画一条水平线。
@@ -835,44 +790,6 @@ func (a *App) isDebug() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.debug
-}
-
-// loadPlan opens a file picker for a YAML plan, reloads it and resets the
-// case tree. If a run is in flight it is stopped first.
-func (a *App) loadPlan() {
-	a.stopIfRunning()
-	a.ResetTiming()
-	fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
-		if err != nil {
-			a.Error("", "open plan: "+err.Error())
-			return
-		}
-		if reader == nil {
-			return // user cancelled the dialog
-		}
-		defer reader.Close()
-		path := reader.URI().Path()
-		plan, err := config.LoadPlan(path)
-		if err != nil {
-			a.Error("", err.Error())
-			return
-		}
-		a.mu.Lock()
-		a.plan = plan
-		a.rows = a.rows[:0]
-		a.mu.Unlock()
-		a.tree.Refresh()
-		for _, c := range plan.Cases {
-			title := c.Title
-			if title == "" {
-				title = c.Name
-			}
-			a.AddRow(title, c.Name)
-		}
-		a.SetStatus("loaded " + path)
-	}, a.win)
-	fd.SetFilter(storage.NewExtensionFileFilter([]string{".yml", ".yaml"}))
-	fd.Show()
 }
 
 // stopIfRunning 若正在运行则先停止并提示。切换/清空 plan 前调用。
@@ -1427,7 +1344,7 @@ func (a *App) startRun() {
 			report.NewYAMLPath(a.reportFileOrDefault()).
 				WithLogfile(a.logf).
 				WithVars(env.Vars),
-			report.NewTAP(&tapWriter{a: a}),             // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
+			report.NewTAP(&tapWriter{a: a}), // TAP 文本重定向进 log 框，不再写 stdout（避免双写）
 			adp,
 			// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
 			// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。
