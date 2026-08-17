@@ -152,3 +152,27 @@ func TestTestModeFromPlanPath(t *testing.T) {
 	}
 }
 
+func TestIsPanelPlan(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// PTVB1 面板模式计划：文件名含 PTVB1
+		{"confs/plan_PTVB1_normal_ut_checkmotor.yml", true},
+		{"plan_PTVB1_normal_ut_checkmotor.yml", true},
+		// 大小写不敏感
+		{"confs/plan_ptvb1_xxx.yml", true},
+		{"confs/plan_Ptvb1_yyy.yml", true},
+		// 非面板计划
+		{"confs/plan_PSAV_ut_check_state.yml", false},
+		{"confs/plan.yml", false},
+		{"examples/hello/plan.yml", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := IsPanelPlan(c.path); got != c.want {
+			t.Errorf("IsPanelPlan(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
+

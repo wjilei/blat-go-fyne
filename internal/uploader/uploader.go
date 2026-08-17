@@ -339,9 +339,10 @@ func getJSON(url string) (any, error) {
 // \$log_str})），LZMA 压缩后上传 OSS；其余生命周期事件只用于累积 cases。
 type HookStopReporter struct {
 	env       *core.Env
-	logSrc    func() string // 备用文本日志源（见 NewHookStop 注释）
-	skipOSS   bool          // --debug：不实际上传/保存，把上报数据打印到日志
-	startTime time.Time     // OnPlanStart 记录的计划开始时间，用于 last_start_time
+	logSrc    func() string       // 备用文本日志源（见 NewHookStop 注释）
+	skipOSS   bool                // --debug：不实际上传/保存，把上报数据打印到日志
+	panelIdx  int                 // 面板工位号（1..3）；0 表示单跑/Console，OSS 路径不加后缀
+	startTime time.Time           // OnPlanStart 记录的计划开始时间，用于 last_start_time
 	cases     []report.CaseReport // OnCaseStop 累积的终态用例，OnPlanStop 时渲染
 }
 
@@ -354,8 +355,11 @@ type HookStopReporter struct {
 //
 // skipOSS 为 true 时（--debug）不触网：跳过 OSS 上传与数据库保存，把三段式
 // YAML 与 buildReporter 完整 payload 打印到日志供排查。
-func NewHookStop(env *core.Env, logSrc func() string, skipOSS bool) *HookStopReporter {
-	return &HookStopReporter{env: env, logSrc: logSrc, skipOSS: skipOSS}
+//
+// panelIdx 是面板工位号（1..3）：>0 时 OSS 路径加 _P<i> 后缀，避免三工位
+// 并发完成同秒上传互相覆盖；0 表示单跑/Console 模式（不加后缀）。
+func NewHookStop(env *core.Env, logSrc func() string, skipOSS bool, panelIdx int) *HookStopReporter {
+	return &HookStopReporter{env: env, logSrc: logSrc, skipOSS: skipOSS, panelIdx: panelIdx}
 }
 
 func (h *HookStopReporter) OnPlanStart(total int, startTime time.Time) {
@@ -387,7 +391,7 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 	// 起取代 logSrc() 的纯文本日志作为上传主体）。
 	yamlBS, err := report.RenderYAMLReport(sum, h.env.Vars, h.cases)
 	if err != nil {
-		h.env.Log.Error("", "渲染三段式 YAML 报告失败: " + err.Error())
+		h.env.Log.Error("", "渲染三段式 YAML 报告失败: "+err.Error())
 		yamlBS = nil // 降级：log 字段留空，不阻塞 SaveTestData
 	}
 	reporter := buildReporter(sum, h.env.Vars, h.startTime, string(yamlBS))
@@ -406,24 +410,24 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 		// debug 模式：不触网，把三段式 YAML 与完整上报 payload 都打印到日志。
 		payload, err := json.MarshalIndent(reporter, "", "  ")
 		if err != nil {
-			h.env.Log.Error("", "debug 序列化上报数据失败: " + err.Error())
+			h.env.Log.Error("", "debug 序列化上报数据失败: "+err.Error())
 			return
 		}
-		h.env.Log.Info("", "debug 模式，不保存测试记录，三段式 YAML 如下:\n" + string(yamlBS))
-		h.env.Log.Info("", "debug 模式，不保存测试记录，上报数据如下:\n" + string(payload))
+		h.env.Log.Info("", "debug 模式，不保存测试记录，三段式 YAML 如下:\n"+string(yamlBS))
+		h.env.Log.Info("", "debug 模式，不保存测试记录，上报数据如下:\n"+string(payload))
 		return
 	}
 
 	// send_report_to_oss：三段式 YAML 压缩为 .lzma 后上传，路径按
 	// 日期/工位/时间 组织（与旧纯文本日志路径模板一致）。
 	workstation := toStr(h.env.Vars["TEST_WORKSTATION"], "")
-	compressed, ossPath, err := compressLog(yamlBS, workstation)
+	compressed, ossPath, err := compressLogPanel(yamlBS, workstation, h.panelIdx)
 	if err != nil {
-		h.env.Log.Error("", "日志压缩失败: " + err.Error())
+		h.env.Log.Error("", "日志压缩失败: "+err.Error())
 	} else if err := UploadLogOSS(context.Background(), ossPath, compressed); err != nil {
-		h.env.Log.Error("", "日志上传OSS失败: " + err.Error())
+		h.env.Log.Error("", "日志上传OSS失败: "+err.Error())
 	} else {
-		h.env.Log.Info("", "日志已上传OSS: " + ossPath)
+		h.env.Log.Info("", "日志已上传OSS: "+ossPath)
 		// 日志已上传到 OSS，把 reporter 的 log 字段替换成 OSS 路径，
 		// 避免把整段 YAML 正文再次塞进数据库请求体（既冗余又容易触发
 		// WAF/body size 限制）。压缩/上传失败时保持 YAML 正文降级，
@@ -433,23 +437,29 @@ func (h *HookStopReporter) hookStop(sum report.Summary) {
 
 	// HeatSaveTestData：把测试记录写入 BLAT 服务器数据库
 	if err := SaveTestData(reporter, devTypeHeat); err != nil {
-		h.env.Log.Error("", "保存数据失败: " + err.Error())
+		h.env.Log.Error("", "保存数据失败: "+err.Error())
 	} else {
 		h.env.Log.Info("", "测试记录已保存")
 	}
 }
 
-// compressLog 把三段式 YAML 字节流压缩为 .lzma 并生成 OSS 路径
+// compressLogPanel 把三段式 YAML 字节流压缩为 .lzma 并生成 OSS 路径
 // （v2/<date>/<workstation>/log_<time>.lzma，对齐 Utils.pm save_log_to_oss
-// 的路径模板）。workstation 为空时路径中该段留空（与旧逻辑一致）。
-func compressLog(content []byte, workstation string) ([]byte, string, error) {
+// 的路径模板）。panelIdx>0 时文件名加 _P<i> 后缀（log_<time>_P<i>.lzma），
+// 避免三工位并发完成同秒上传互相覆盖。workstation 为空时路径中该段留空
+// （与旧逻辑一致）。
+func compressLogPanel(content []byte, workstation string, panelIdx int) ([]byte, string, error) {
 	compressed, err := LzmaCompress(content)
 	if err != nil {
 		return nil, "", err
 	}
 	now := time.Now()
-	ossPath := fmt.Sprintf("v2/%s/%s/log_%s.lzma",
-		now.Format("20060102"), workstation, now.Format("150405"))
+	suffix := ""
+	if panelIdx > 0 {
+		suffix = fmt.Sprintf("_P%d", panelIdx)
+	}
+	ossPath := fmt.Sprintf("v2/%s/%s/log_%s%s.lzma",
+		now.Format("20060102"), workstation, now.Format("150405"), suffix)
 	return compressed, ossPath, nil
 }
 
@@ -497,18 +507,4 @@ func toStr(v any, def string) string {
 		return s
 	}
 	return def
-}
-
-// toInt 把 int/int64/float64 转为 int；nil 或其他类型返回 0。
-func toInt(v any) int {
-	switch n := v.(type) {
-	case int:
-		return n
-	case int64:
-		return int(n)
-	case float64:
-		return int(n)
-	default:
-		return 0
-	}
 }

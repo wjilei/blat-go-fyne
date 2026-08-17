@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,6 +65,66 @@ func TestDefaultTestLogPath_Dev(t *testing.T) {
 	t.Setenv("BLAT_DEV_FILES", "1")
 	if got := DefaultTestLogPath(); got != "test.log" {
 		t.Fatalf("dev mode TestLogPath = %q, want %q", got, "test.log")
+	}
+}
+
+func TestDefaultPanelLogPath_Dev(t *testing.T) {
+	t.Setenv("BLAT_DEV_FILES", "1")
+	for i := 1; i <= 3; i++ {
+		got := DefaultPanelLogPath(i)
+		want := fmt.Sprintf("test_P%d.log", i)
+		if got != want {
+			t.Errorf("DefaultPanelLogPath(%d) = %q, want %q", i, got, want)
+		}
+		// 与 DefaultTestLogPath 同目录（dev → cwd）
+		if filepath.Dir(got) != filepath.Dir(DefaultTestLogPath()) {
+			t.Errorf("DefaultPanelLogPath(%d) dir = %q, want %q", i, filepath.Dir(got), filepath.Dir(DefaultTestLogPath()))
+		}
+	}
+}
+
+func TestDefaultPanelLogPath_Release(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	// 强制走 release 分支，避免依赖 exe 路径检测（与 TestDefaultTestLogPath_Release 一致）。
+	t.Setenv("BLAT_DEV_FILES", "release")
+	for i := 1; i <= 3; i++ {
+		got := DefaultPanelLogPath(i)
+		want := filepath.Join(dir, ".blat", fmt.Sprintf("test_P%d.log", i))
+		if got != want {
+			t.Errorf("DefaultPanelLogPath(%d) = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestDefaultPanelReportPath_Dev(t *testing.T) {
+	t.Setenv("BLAT_DEV_FILES", "1")
+	for i := 1; i <= 3; i++ {
+		got := DefaultPanelReportPath(i)
+		want := fmt.Sprintf("report_P%d.yml", i)
+		if got != want {
+			t.Errorf("DefaultPanelReportPath(%d) = %q, want %q", i, got, want)
+		}
+		// 与 DefaultReportPath 同目录（dev → cwd）
+		if filepath.Dir(got) != filepath.Dir(DefaultReportPath()) {
+			t.Errorf("DefaultPanelReportPath(%d) dir = %q, want %q", i, filepath.Dir(got), filepath.Dir(DefaultReportPath()))
+		}
+	}
+}
+
+func TestDefaultPanelReportPath_Release(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	// 强制走 release 分支，避免依赖 exe 路径检测（与 TestDefaultPanelLogPath_Release 一致）。
+	t.Setenv("BLAT_DEV_FILES", "release")
+	for i := 1; i <= 3; i++ {
+		got := DefaultPanelReportPath(i)
+		want := filepath.Join(dir, ".blat", fmt.Sprintf("report_P%d.yml", i))
+		if got != want {
+			t.Errorf("DefaultPanelReportPath(%d) = %q, want %q", i, got, want)
+		}
 	}
 }
 

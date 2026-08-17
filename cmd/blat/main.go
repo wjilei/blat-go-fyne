@@ -69,6 +69,7 @@ func main() {
 	envPath := flag.String("env", config.DefaultEnvPath(), "path to vars YAML (e.g. MBUS port); 缺文件忽略；默认 ~/.blat/env.yml")
 	noGUI := flag.Bool("no-gui", false, "use console UI instead of Fyne window")
 	mockBT := flag.Bool("mock-bt", false, "use mock bluetooth (no hardware); 默认 false 走真实 BLE")
+	mockMBus := flag.Bool("mock-mbus", false, "use mock m-bus (no hardware); 默认 false 走真实串口")
 	debug := flag.Bool("debug", false, "debug 模式：不实际上传 OSS / 保存数据库，把要上报的数据打印到日志")
 	uploaderPath := flag.String("uploader", "confs/uploader.yml", "path to uploader credentials YAML")
 	flag.Parse()
@@ -155,6 +156,10 @@ func main() {
 		vars["HeatNote"] = heatnote
 	}
 	heatnote["bt_mock"] = *mockBT
+	// 注入 m-bus mock 开关（与 bt_mock 对称）：case 端据此选择构造 mock
+	// 还是 real mbus 设备。HeatNote 键小写 "mbus_mock" 存 bool（与
+	// wire_valve_mbus.go _ensureMBUS 的读取键一致）。
+	heatnote["mbus_mock"] = *mockMBus
 
 	// 当前计划文件路径写入 env.Vars["HeatNote"]["plan"]，case 运行时据此
 	// 做计划判断；未传 --plan 时删除历史残留键（GUI 模式由下拉框接管该值）。
@@ -212,7 +217,8 @@ func runConsole(plan *config.Plan, vars map[string]any, debug bool) int {
 		// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
 		// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。
 		// 日志取 Console 环形缓冲的完整快照；--debug 时不触网，仅打印上报数据。
-		uploader.NewHookStop(env, c.SnapshotLog, debug),
+		// panelIdx=0：Console 模式 OSS 路径不加 _P 后缀。
+		uploader.NewHookStop(env, c.SnapshotLog, debug, 0),
 	)
 	if err := pr.RunPlan(context.Background(), plan, env, rep); err != nil {
 		fmt.Fprintln(os.Stderr, "FAIL:", err)

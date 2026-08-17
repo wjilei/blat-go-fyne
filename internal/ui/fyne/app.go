@@ -223,6 +223,24 @@ type App struct {
 	// 创建（旧的若有先取消），OnPlanStop 时取消。每 100ms 触发一次
 	// tree.Refresh() 让 MM:SS.mmm 计时器在 UI 上"实时走动"。
 	tickCancel context.CancelFunc
+
+	// mode 是当前界面模式："single"（单跑，PSAV 蓝牙测试）或 "panel"
+	// （三工位面板，PTVB1 整机测试）。随计划切换（onPlanSelected →
+	// switchMode），受 mu 保护。
+	mode string
+	// mainTabs 是主区域 Tab 容器：Tab「测试」= 单跑界面，Tab「工位测试」
+	// = 三面板页。仅在 Fyne 主线程访问（build 创建、switchMode 切页）。
+	mainTabs *container.AppTabs
+	// stations 是三个工位面板（下标 0..2 对应设备1..3），build 时创建后只读。
+	stations []*stationPanel
+	// stationRuns 是三个工位的运行上下文；槽位非 nil 表示该工位正在运行。
+	// 受 mu 保护（startStation 登记、goroutine 结束清空、stopStation /
+	// switchMode / stopAllStations 读取）。
+	stationRuns []*stationRun
+	// suppressPlanSel 是计划下拉框回退 guard：switchMode 拒绝后
+	// SetSelected(old) 触发的 onPlanSelected 回调直接吞掉，避免递归加载
+	// 旧计划（连带 stopIfRunning 强停当前 run）。受 mu 保护。
+	suppressPlanSel bool
 }
 
 // keyButton 把按钮包装成可聚焦的键盘操作组件：焦点在它上面时（转调
@@ -307,6 +325,8 @@ func New(title string) *App {
 	win.SetOnClosed(func() {
 		a.once.Do(func() { close(a.shutdown) })
 		a.StopRun()
+		// 面板模式：级联停止所有工位运行（各自 cancel，goroutine 自行收尾）。
+		a.stopAllStations()
 		// ticker goroutine select 的是 tickCancel（context），不监听
 		// a.shutdown；进程退出 OS 会回收，但显式关掉避免日志/分析
 		// 工具误判 goroutine 泄漏。
@@ -543,11 +563,20 @@ func (a *App) build() {
 	// 程序主场口，左右两栏，左窄右宽
 	mainFrame := container.NewHSplit(a.tree, a.logScroll)
 	mainFrame.SetOffset(0.3)
+	// 面板模式页：三工位面板（buildPanelPage 在 panelpage.go 实现）。
+	panelBox := a.buildPanelPage()
+	// 主区域改为 AppTabs：Tab「测试」= 单跑界面（原样保留），
+	// Tab「工位测试」= 三面板页。初始 mode="single"。
+	a.mode = "single"
+	a.mainTabs = container.NewAppTabs(
+		container.NewTabItem("测试", mainFrame),
+		container.NewTabItem("工位测试", panelBox),
+	)
 	// 包一层 MinSize 下限：Fyne v2.8 glfw 在 Windows 上最小化恢复时
 	// 会把窗口 clamp 到 content 的 MinSize（极小），导致窗口变小。
 	// 用自定义 layout 的 Container 保证 center 区域 MinSize ≥ 960x640，
 	// 恢复路径会回到初始尺寸。
-	center := container.New(minSizeLayout{min: fyne.NewSize(960, 640)}, mainFrame)
+	center := container.New(minSizeLayout{min: fyne.NewSize(960, 640)}, a.mainTabs)
 	a.win.SetContent(container.NewBorder(tb, statusBar, nil, nil, center))
 	// Fyne Tree 的根节点（t.Root=""）不可见，且 IsBranchOpen 默认 false：
 	// 若不显式展开根，walk() 不会下钻到 childUIDs("") 返回的子节点。
@@ -831,6 +860,15 @@ func (a *App) SetPlanList(items []PlanItem, selectPath string) {
 // onPlanSelected 是下拉框的回调：选中某个测试计划则加载并填入左侧树，
 // 选中占位项"请选择测试计划"则清空 plan 与树。
 func (a *App) onPlanSelected(name string) {
+	// 回退 guard：switchMode 拒绝后 SetSelected(old) 触发的回调直接吞掉，
+	// 避免递归加载旧计划（连带 stopIfRunning 强停当前 run）。
+	a.mu.Lock()
+	suppress := a.suppressPlanSel
+	a.suppressPlanSel = false
+	a.mu.Unlock()
+	if suppress {
+		return
+	}
 	if name == "" || name == planPlaceholder {
 		a.clearPlan()
 		return
@@ -840,7 +878,39 @@ func (a *App) onPlanSelected(name string) {
 		a.Warn("", "未知计划: "+name)
 		return
 	}
-	a.loadPlanByPath(path)
+	// 记录当前生效 plan 的显示名，供模式切换被拒绝时回退下拉框
+	// （回调触发时 planSel.Selected 已是新值，旧值只能从 a.plan 反推）。
+	old := a.currentPlanName()
+	if !a.loadPlanByPath(path) {
+		// 模式切换被拒绝：回退下拉框到旧值（guard 防止回调递归）。
+		a.mu.Lock()
+		a.suppressPlanSel = true
+		a.mu.Unlock()
+		a.planSel.SetSelected(old)
+		return
+	}
+}
+
+// currentPlanName 返回当前生效 plan 在下拉框中的显示名；未加载 plan 时
+// 返回占位项。用于模式切换被拒绝时回退下拉框。
+func (a *App) currentPlanName() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var path string
+	if a.env != nil {
+		if hn, ok := a.env.Vars["HeatNote"].(map[string]any); ok {
+			path, _ = hn["plan"].(string)
+		}
+	}
+	if path == "" {
+		return planPlaceholder
+	}
+	for _, it := range a.planItems {
+		if filepath.Clean(it.Path) == filepath.Clean(path) {
+			return it.Name
+		}
+	}
+	return planPlaceholder
 }
 
 // planPath 按显示名查 plan.yml 路径。
@@ -857,14 +927,21 @@ func (a *App) planPath(name string) string {
 
 // loadPlanByPath 加载 plan.yml：清空并重建左侧用例树，把计划文件路径写入
 // env.Vars["HeatNote"]["plan"] 供 case 运行时做判断。
-func (a *App) loadPlanByPath(path string) {
-	a.stopIfRunning()
-	a.ResetTiming()
+// 返回 false 表示加载失败或面板模式切换被拒绝（此时不重建用例树、不强停
+// 另一模式的运行任务，调用方负责回退下拉框）。
+func (a *App) loadPlanByPath(path string) bool {
 	plan, err := config.LoadPlan(path)
 	if err != nil {
 		a.Error("", err.Error())
-		return
+		return false
 	}
+	// 面板模式切换：加载成功后按计划类型切换界面模式；被拒绝时中止，
+	// 不重建用例树、不强停另一模式的运行任务（不做自动强停）。
+	if !a.switchMode(config.IsPanelPlan(path)) {
+		return false
+	}
+	a.stopIfRunning()
+	a.ResetTiming()
 	a.mu.Lock()
 	a.plan = plan
 	a.rows = a.rows[:0]
@@ -878,7 +955,12 @@ func (a *App) loadPlanByPath(path string) {
 		a.AddRow(title, c.Name)
 	}
 	a.setPlanVar(path)
+	// 按当前计划路径同步 test_mode 到基础 env（setTestModeFromPlan 从
+	// env.Vars["HeatNote"]["plan"] 解析模式）。面板 bootStation 从基础 env
+	// 拷 test_mode 到工位 vars，保证 PTVB1 工位上报不带 PSAV 残留模式。
+	a.setTestModeFromPlan()
 	a.SetStatus("loaded " + path)
+	return true
 }
 
 // clearPlan 清空当前 plan 与用例树（下拉框停在"请选择测试计划"）。
@@ -1019,6 +1101,23 @@ func (a *App) setSerialVar(serial string) error {
 	return nil
 }
 
+// applyTestRecordTo 把查询到的整机测试记录字段写入 vars["HeatNote"]，
+// 供本次测试的 case 与 hook_stop 上报使用。纯函数不持锁；调用方负责保证
+// vars 的并发安全（单跑模式写 a.env.Vars 需持 a.mu，面板模式写工位私有
+// vars 无需锁）。
+func applyTestRecordTo(vars map[string]any, rec map[string]any) {
+	hn, _ := vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		hn = map[string]any{}
+	}
+	for _, k := range []string{"pn", "lot", "model", "user", "test_type", "tenant_id"} {
+		if v, ok := rec[k]; ok {
+			hn[k] = v
+		}
+	}
+	vars["HeatNote"] = hn
+}
+
 // applyTestRecord 把开始测试前查询到的整机测试记录字段写入
 // env.Vars["HeatNote"]，供本次测试的 case 与 hook_stop 上报使用。
 // 与 setSerialVar 一样是临时运行状态，不随配置落盘持久化。
@@ -1028,16 +1127,7 @@ func (a *App) applyTestRecord(rec map[string]any) {
 	if a.env == nil {
 		return
 	}
-	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
-	if hn == nil {
-		hn = map[string]any{}
-	}
-	for _, k := range []string{"pn", "lot", "model", "user", "test_type", "tenant_id"} {
-		if v, ok := rec[k]; ok {
-			hn[k] = v
-		}
-	}
-	a.env.Vars["HeatNote"] = hn
+	applyTestRecordTo(a.env.Vars, rec)
 }
 
 // setTestModeFromPlan 从当前计划文件名解析测试模式：匹配 PSAV_(XXX).yml /
@@ -1211,6 +1301,19 @@ var serialFormatRe = regexp.MustCompile(`^W?\d{12}`)
 // 会渲染一个空按钮占位栏（"第三个空按钮"的来源），后者在点"确定"后必
 // 然自动 dismiss 无法阻止弹框关闭。改用 widget.NewPopUp 自管全部布局。
 func (a *App) promptSerialThenRun() {
+	// 面板模式：工具栏"开始测试"按钮保留，点击时提示用面板输入启动
+	// （对齐 Perl hook_prepare_run 兜底），不进入单跑流程。
+	a.mu.Lock()
+	mode := a.mode
+	a.mu.Unlock()
+	if mode == "panel" {
+		// 异步推弹框到 goroutine，避免在 Fyne 主线程（按钮回调）自死锁：
+		// a.Message 第二个 select 等 reply，而 pump 排上来的 fyne.Do 需要
+		// 主线程处理，主线程被自己阻塞 → 死锁。和 station.handleStart 的
+		// 弹框死锁同一根因、同一修复（go a.Message 让主线程立即返回）。
+		go a.Message(context.Background(), "请使用工位面板测试：在对应工位输入序列号，回车即开始测试", false)
+		return
+	}
 	entry := widget.NewEntry()
 	entry.SetPlaceHolder("请输入序列号（12 位数字，可选 W 开头）")
 	// Entry 默认 MinSize 较窄，撑出 360 像素让弹窗整体更合理（避免
@@ -1343,7 +1446,8 @@ func (a *App) startRun() {
 			// hook_stop 上报：测试全部跑完后把日志压缩上传 OSS，并把测试记录
 			// POST 到 BLAT 服务器数据库（对齐 Perl HeatAppUI.hook_stop）。
 			// 日志取 GUI 环形缓冲的完整快照；--debug 时不触网，仅打印上报数据。
-			uploader.NewHookStop(env, a.SnapshotLog, a.debug),
+			// panelIdx=0：单跑模式 OSS 路径不加 _P 后缀。
+			uploader.NewHookStop(env, a.SnapshotLog, a.debug, 0),
 		)
 		err := pr.RunPlan(ctx, plan, env, rep)
 		// 在调 runFinished（清掉 runCtx）前标记取消态，OnPlanStop 仍能读到。

@@ -20,13 +20,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // planModeRe 匹配计划文件名中的测试模式：形如 PSAV_<mode>.yml / PTVB1_<mode>.yml
-// （允许 plan_ 等前缀，大小写不敏感）。捕获组 1 是 PSAV_/PTVB1_ 后到 .yml 前的内容。
-var planModeRe = regexp.MustCompile(`(?i)(?:PSAV|PTVB1)_(.+)\.ya?ml$`)
+// / PFW_<mode>.yml（允许 plan_ 等前缀，大小写不敏感）。捕获组 1 是
+// PSAV_/PTVB1_/PFW_ 后到 .yml 前的内容。
+var planModeRe = regexp.MustCompile(`(?i)(?:PSAV|PTVB1|PFW)_(.+)\.ya?ml$`)
 
 // TestModeFromPlanPath 从计划文件名解析测试模式：匹配 PSAV_(XXX).yml /
 // PFW_(XXX).yml，返回括号里的 XXX 作为 test_mode；不匹配时返回空串。
@@ -40,6 +42,15 @@ func TestModeFromPlanPath(path string) string {
 		return ""
 	}
 	return m[1]
+}
+
+// IsPanelPlan 判断计划路径是否为 PTVB1 面板模式计划：文件名含 PTVB1
+// （大小写不敏感）。例如 confs/plan_PTVB1_normal_ut_checkmotor.yml → true。
+func IsPanelPlan(path string) bool {
+	if path == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(filepath.Base(path)), "ptvb1")
 }
 
 // reserved fields are decoded into the struct; everything else lands in

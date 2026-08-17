@@ -55,6 +55,22 @@ func DefaultTestLogPath() string {
 	return testLogFileName
 }
 
+// DefaultPanelLogPath 返回面板模式下第 i 号工位（从 1 开始）的日志文件路径：
+// 文件名 test_P<i>.log，落盘目录规则与 DefaultTestLogPath 完全一致
+// （release → ~/.blat/，dev → cwd）。目录直接由 DefaultTestLogPath 推导，
+// 不重复实现 dev/release 判定。
+func DefaultPanelLogPath(i int) string {
+	return filepath.Join(filepath.Dir(DefaultTestLogPath()), fmt.Sprintf("test_P%d.log", i))
+}
+
+// DefaultPanelReportPath 返回面板模式下第 i 号工位（从 1 开始）的 YAML 报告
+// 文件路径：文件名 report_P<i>.yml，落盘目录规则与 DefaultReportPath 完全一致
+// （release → ~/.blat/，dev → cwd）。目录直接由 DefaultReportPath 推导，
+// 不重复实现 dev/release 判定。
+func DefaultPanelReportPath(i int) string {
+	return filepath.Join(filepath.Dir(DefaultReportPath()), fmt.Sprintf("report_P%d.yml", i))
+}
+
 // DefaultReportPath 返回 YAML 报告文件路径（GUI 模式固定文件名）。
 // release → ~/.blat/report.yml；dev → ./report.yml。
 func DefaultReportPath() string {

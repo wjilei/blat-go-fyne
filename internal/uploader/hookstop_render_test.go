@@ -13,6 +13,7 @@ package uploader
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -70,7 +71,7 @@ func TestHookStopReporter_RendersYAMLReport(t *testing.T) {
 	logger := &recordLogger{}
 	env := &core.Env{Vars: vars, Log: logger}
 
-	h := NewHookStop(env, nil, true) // skipOSS=true：不触网，走 debug 打印分支
+	h := NewHookStop(env, nil, true, 0) // skipOSS=true：不触网，走 debug 打印分支
 	h.OnPlanStart(3, time.Now())
 
 	cases := []report.CaseReport{
@@ -152,18 +153,18 @@ func TestHookStopReporter_RendersYAMLReport(t *testing.T) {
 	}
 }
 
-// TestCompressLog_ProducesLzmaAndPath 验证 compressLog 压缩后可解压还原，
+// TestCompressLog_ProducesLzmaAndPath 验证 compressLogPanel 压缩后可解压还原，
 // ossPath 符合 v2/<date>/<workstation>/log_<time>.lzma 模板（任务 B Refactor
 // 抽取的 helper，纯逻辑不触网）。
 func TestCompressLog_ProducesLzmaAndPath(t *testing.T) {
 	content := []byte("summary:\n  test_total_num: 1\n---\n- case_seq: 1\n")
 
-	compressed, ossPath, err := compressLog(content, "WS-01")
+	compressed, ossPath, err := compressLogPanel(content, "WS-01", 0)
 	if err != nil {
-		t.Fatalf("compressLog() error = %v", err)
+		t.Fatalf("compressLogPanel() error = %v", err)
 	}
 	if len(compressed) == 0 {
-		t.Fatal("compressLog() 返回空压缩字节")
+		t.Fatal("compressLogPanel() 返回空压缩字节")
 	}
 	// 路径模板：v2/<date>/<ws>/log_<time>.lzma
 	if !strings.HasPrefix(ossPath, "v2/") || !strings.HasSuffix(ossPath, ".lzma") {
@@ -171,6 +172,10 @@ func TestCompressLog_ProducesLzmaAndPath(t *testing.T) {
 	}
 	if !strings.Contains(ossPath, "/WS-01/") {
 		t.Errorf("ossPath = %q, want 含工作站段 WS-01", ossPath)
+	}
+	// panelIdx=0：不加 _P 后缀
+	if strings.Contains(ossPath, "_P") {
+		t.Errorf("ossPath = %q, panelIdx=0 不应含 _P 后缀", ossPath)
 	}
 
 	// LZMA 可解压还原原始字节流。
@@ -180,5 +185,21 @@ func TestCompressLog_ProducesLzmaAndPath(t *testing.T) {
 	}
 	if string(back) != string(content) {
 		t.Errorf("解压内容不还原:\ngot  %q\nwant %q", back, content)
+	}
+}
+
+// TestCompressLogPanel_Suffix 验证 panelIdx>0 时 OSS 路径文件名带 _P<i> 后缀，
+// 三工位并发完成同秒上传不会互相覆盖。
+func TestCompressLogPanel_Suffix(t *testing.T) {
+	content := []byte("summary:\n  test_total_num: 1\n")
+	for _, idx := range []int{1, 2, 3} {
+		_, ossPath, err := compressLogPanel(content, "WS-01", idx)
+		if err != nil {
+			t.Fatalf("compressLogPanel(panelIdx=%d) error = %v", idx, err)
+		}
+		want := fmt.Sprintf("_P%d.lzma", idx)
+		if !strings.HasSuffix(ossPath, want) {
+			t.Errorf("ossPath = %q, want 后缀 %q", ossPath, want)
+		}
 	}
 }
