@@ -29,7 +29,7 @@ import (
 // 属逻辑常量，保留在代码里。
 const devTypeHeat = "2"
 
-// Config 是上报所需的非敏感配置，由 config.LoadUploader 从 YAML 加载后经 Init 注入。
+// Config 是上报所需的非敏感配置，由 config.Load 从 YAML 加载后经 Init 注入。
 // OSS 不再含长效 AccessKey/SecretKey——每次上传通过 BlatConfig.BaseURL + Token
 // 从 BLAT 后台 GET /v1/ststoken 拉取 STS 临时凭证（见 sts.go）。
 type Config struct {

@@ -1,0 +1,8 @@
+# 上报凭据配置（OSS 日志上传 + BLAT 后台存库）。
+# 本文件含敏感凭据，已被 .gitignore 忽略，不要提交到 git。
+oss:
+    endpoint: "oss-cn-hangzhou.aliyuncs.com"
+    log_bucket: "blat-app-log"
+blat:
+    base_url: "https://blat.poersmart.com"
+    token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyaWQiOjI4LCJ1c2VybmFtZSI6ImNyX2Nlc2hpIiwidGVuYW50aWQiOjEsImV4cGlyZWF0Ijo2ODg3ODg4MTc3MCwiZXhwIjo2ODg3ODg4MTc3MCwianRpIjoiNjMxNjEwMTIzNzM5MDA0OTI2IiwiaWF0IjoxNzg1OTk4NTcwLCJpc3MiOiJzZXJ2ZXIiLCJuYmYiOjE3ODU5OTg1NzAsInN1YiI6ImNyX2Nlc2hpIn0.ji-aS_4IJyF6RAawzoc_VyZ7gI2JhI5X2gxnaS-oqE0s8nlJE92I6gkjk5QsHwRKIrqTg_Zw4X3EEAv22UoyQd9U4hiNA64Li5flL6Gw8P1GzgtaUDMRvsxCivXS05afbi6kVEDLXOb66UyLghqXOgLW4xNXTEnezK1pgtFLMcE"

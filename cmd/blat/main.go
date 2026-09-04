@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"blat/cmd/blat/cases"
 	"blat/internal/config"
@@ -39,7 +38,6 @@ import (
 	"blat/internal/device/bluetooth"
 	"blat/internal/report"
 	"blat/internal/runtime"
-	"blat/internal/st"
 	"blat/internal/ui"
 	fyneui "blat/internal/ui/fyne"
 	"blat/internal/uploader"
@@ -71,13 +69,13 @@ func main() {
 	mockBT := flag.Bool("mock-bt", false, "use mock bluetooth (no hardware); 默认 false 走真实 BLE")
 	mockMBus := flag.Bool("mock-mbus", false, "use mock m-bus (no hardware); 默认 false 走真实串口")
 	debug := flag.Bool("debug", false, "debug 模式：不实际上传 OSS / 保存数据库，把要上报的数据打印到日志")
-	uploaderPath := flag.String("uploader", "confs/uploader.yml", "path to uploader credentials YAML")
+	uploaderPath := flag.String("uploader", "confs/config.yml", "path to uploader credentials YAML")
 	flag.Parse()
 
 	// 上报凭据配置（OSS 日志上传 + BLAT 后台存库）：从 YAML 加载并注入
 	// uploader 包。凭据是必需的，缺文件或解析失败直接退出，不构造有效
 	// 上报请求继续跑。
-	ucfg, err := config.LoadUploader(*uploaderPath)
+	ucfg, err := config.Load(*uploaderPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load uploader config:", err)
 		os.Exit(2)
@@ -172,15 +170,15 @@ func main() {
 	// 从 env.yml 预置序列号解出 ST 并查映射表，把管径写入 HeatNote["pipe"]
 	// （无管径族写 0）。GUI 运行时扫入新序列号会经 setSerialVar 重新解析
 	// 覆盖该值；这里保证 console 模式与 GUI 初始态都有正确的管径。
-	if serial, ok := heatnote["serial"].(string); ok && serial != "" {
-		if pipeStr, ok := st.PipeFromSerial(serial); ok {
-			pipe := 0
-			if pipeStr != "" {
-				pipe, _ = strconv.Atoi(pipeStr)
-			}
-			heatnote["pipe"] = pipe
-		}
-	}
+	// if serial, ok := heatnote["serial"].(string); ok && serial != "" {
+	// 	if pipeStr, ok := st.PipeFromSerial(serial); ok {
+	// 		pipe := 0
+	// 		if pipeStr != "" {
+	// 			pipe, _ = strconv.Atoi(pipeStr)
+	// 		}
+	// 		heatnote["pipe"] = pipe
+	// 	}
+	// }
 
 	if *noGUI {
 		if plan == nil {

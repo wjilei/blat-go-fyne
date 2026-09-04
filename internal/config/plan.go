@@ -55,6 +55,8 @@ func IsPanelPlan(path string) bool {
 
 // reserved fields are decoded into the struct; everything else lands in
 // Args. Keep this list in sync with the doc-comment above.
+
+// CaseItem ...
 type CaseItem struct {
 	Name     string         `yaml:"name"`
 	Title    string         `yaml:"title"`
@@ -77,9 +79,9 @@ func LoadPlan(path string) (*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read plan %s: %w", path, err)
 	}
-	// Decode as generic node first so we can detect a non-sequence top
-	// level and report a clear error. yaml.Unmarshal wraps everything in
-	// a DocumentNode; the actual root sits in doc.Content[0].
+	// 先按通用节点解码，以便在顶层不是序列时给出明确错误。
+	// yaml.Unmarshal 会把整个内容包成 DocumentNode，真正的根在
+	// doc.Content[0]。
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse plan %s: %w", path, err)

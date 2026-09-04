@@ -22,7 +22,7 @@ blat:
 		t.Fatalf("write uploader yaml: %v", err)
 	}
 
-	cfg, err := LoadUploader(path)
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("LoadUploader() error = %v", err)
 	}
@@ -43,7 +43,7 @@ blat:
 // TestLoadUploader_MissingFile 验证加载不存在的文件必须返回 error。
 func TestLoadUploader_MissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "no_such_uploader.yml")
-	if _, err := LoadUploader(path); err == nil {
+	if _, err := Load(path); err == nil {
 		t.Fatal("LoadUploader() error = nil, want error for missing file")
 	}
 }
@@ -55,7 +55,7 @@ func TestLoadUploader_BadYAML(t *testing.T) {
 	if err := os.WriteFile(path, []byte("oss: [unclosed"), 0o644); err != nil {
 		t.Fatalf("write bad yaml: %v", err)
 	}
-	if _, err := LoadUploader(path); err == nil {
+	if _, err := Load(path); err == nil {
 		t.Fatal("LoadUploader() error = nil, want error for bad yaml")
 	}
 }
