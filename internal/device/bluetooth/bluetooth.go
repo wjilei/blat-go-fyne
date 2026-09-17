@@ -68,12 +68,13 @@ var (
 // GATT 发现时间/重试常量（对齐 Perl export.go 7b1f4349 起：
 // 升级 service 发现总预算 5s→16s，引入 service/characteristic 重试与退避）。
 const (
-	serviceDiscoveryTimeout             = 16 * time.Second
-	characteristicDiscoveryTimeout      = 5 * time.Second
-	gattDiscoveryGateTimeout            = 5 * time.Second
-	gattDiscoveryRetryDelay             = 250 * time.Millisecond
-	serviceDiscoveryRetryCount          = 3
-	characteristicDiscoveryRetryCount   = 8
+	scanTimeout                       = 30 * time.Second
+	serviceDiscoveryTimeout           = 16 * time.Second
+	characteristicDiscoveryTimeout    = 5 * time.Second
+	gattDiscoveryGateTimeout          = 5 * time.Second
+	gattDiscoveryRetryDelay           = 250 * time.Millisecond
+	serviceDiscoveryRetryCount        = 3
+	characteristicDiscoveryRetryCount = 8
 )
 
 // GATT 发现进程级门闸与 hung 状态。Windows 的 WinRT GATT 发现存在“卡死”
@@ -145,6 +146,11 @@ type Device struct {
 	// connectedSinceReboot records the last Reboot() time; used by the
 	// ResetValve mock to restore a clean ValveState.
 	connectedSinceReboot time.Time
+
+	// openingPre 记录最近一次 SetValveOpening 调用写入的开度（0-100）。
+	// 仅 mock 用于断言；real 模式走 setConfigReal 不依赖该字段。零值表示
+	// 尚未调用，默认初始值视为未设置。
+	openingPre int
 
 	status Status // mock 数据，SetMockStatus 可注入测试场景
 
@@ -474,7 +480,7 @@ func (d *Device) scanAndConnect(targetMac, legacyMac string) (bt.Device, error) 
 	legacy := strings.ToUpper(legacyMac)
 	addrChan := make(chan bt.Address, 1)
 	scanErrChan := make(chan error, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), serviceDiscoveryTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancel()
 
 	d.logDebug(fmt.Sprintf("蓝牙扫描开始（直接连接失败，走扫描兜底），目标地址 %s 兼容地址 %s", target, legacy))
@@ -669,6 +675,38 @@ func (d *Device) ResetValve(ctx context.Context) error {
 	p := DefaultSetConfigPayload(time.Now())
 	p.CtrlType = intPtr(0x5b)
 	return d.setConfigReal(ctx, p)
+}
+
+// SetValveOpening 设置阀门开度（0-100 整数百分比）。mock：把 pre 写入
+// openingPre 字段供测试断言；real：发送 SetConfig 帧，覆盖 SetOpenPre
+// 字段（tag 8），其余字段由 DefaultSetConfigPayload 默认填充。
+//
+// pre 必须在 [0,100] 范围内（含边界），否则返回错误而不发起任何通信。
+// 该方法不带 CtrlType——只设开度，不强制阀门动作，由固件按当前状态解释。
+func (d *Device) SetValveOpening(ctx context.Context, pre int) error {
+	if pre < 0 || pre > 100 {
+		return fmt.Errorf("开度值必须在 0-100 之间: %d", pre)
+	}
+	if d.mock {
+		if err := ctxErr(ctx); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		d.openingPre = pre
+		d.mu.Unlock()
+		return nil
+	}
+	p := DefaultSetConfigPayload(time.Now())
+	p.SetOpenPre = intPtr(pre)
+	return d.setConfigReal(ctx, p)
+}
+
+// mockOpenPre 返回最近一次 SetValveOpening 写入的开度（仅 mock 模式有
+// 意义；real 模式始终返回零值）。同包测试用于断言参数被正确接收。
+func (d *Device) mockOpenPre() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.openingPre
 }
 
 // setConfigReal 在真实模式下构造 SetConfig 帧（01+devTypeByte+CBOR(p)）
@@ -1405,7 +1443,7 @@ func idMacHash(id string) uint64 {
 }
 
 // ParseIdToMac 把设备序列号 id 派生为**新格式** BLE 广播地址
-//（FC:XX:XX:XX:XX:XX，共 5 字节哈希）。对应 Perl 7b1f4349 升级后的
+// （FC:XX:XX:XX:XX:XX，共 5 字节哈希）。对应 Perl 7b1f4349 升级后的
 // parseIdToMac：新格式比旧格式（FC:E8:92: + 3 字节）多算 2 字节以减小
 // 哈希冲突概率。Go 侧从截断 uint64 中取低 40 位（5 字节），与 Perl
 // Math::BigInt 无限精度结果等价（2^40 | 2^64）。

@@ -487,6 +487,45 @@ func TestBuildSetValveFrame_InvalidMAC(t *testing.T) {
 	}
 }
 
+// TestBuildSetValveFrame_OpenPreAndCalcDay30 校验 SetValveOpenpreByMbus 的帧
+// 字节布局（对应 Perl UserValve.pm L624-630 SetValveOpenpreByMbus →
+// _SetValveByMbus(addr, open_pre, 30)）：cmd_id BB1F、sub_id 0x01、data 段
+// 字节 17=open_pre、字节 18=calc_day=30（不是 CaliValveByMbus 的 0xff）。
+func TestBuildSetValveFrame_OpenPreAndCalcDay30(t *testing.T) {
+	for _, pre := range []byte{0, 1, 50, 100} {
+		frame, err := buildSetValveFrame("262601300011", pre, 30)
+		if err != nil {
+			t.Fatalf("buildSetValveFrame(pre=%d): %v", pre, err)
+		}
+		if len(frame) != 21 {
+			t.Fatalf("帧长 = %d, 期望 21", len(frame))
+		}
+		if frame[14] != 0xbb || frame[15] != 0x1f {
+			t.Errorf("pre=%d cmd_id = %02x%02x, 期望 bb1f", pre, frame[14], frame[15])
+		}
+		if frame[16] != 0x01 {
+			t.Errorf("pre=%d sub_id = %02x, 期望 01", pre, frame[16])
+		}
+		if frame[17] != pre {
+			t.Errorf("pre=%d open_pre 字节 = %02x, 期望 %02x", pre, frame[17], pre)
+		}
+		if frame[18] != 30 {
+			t.Errorf("pre=%d calc_day = %02x, 期望 1e（SetValveOpenpreByMbus 用 30）", pre, frame[18])
+		}
+		// CS 仍按 sum(3..18) 计算。
+		var cs byte
+		for i := 3; i <= 18; i++ {
+			cs += frame[i]
+		}
+		if frame[19] != cs {
+			t.Errorf("pre=%d CS = %02x, 期望 %02x", pre, frame[19], cs)
+		}
+		if frame[20] != 0x16 {
+			t.Errorf("pre=%d 结束符 = %02x, 期望 16", pre, frame[20])
+		}
+	}
+}
+
 func TestParseSetValveResponse(t *testing.T) {
 	if err := parseSetValveResponse(buildTestSetValveResponse()); err != nil {
 		t.Fatalf("parseSetValveResponse 合法响应意外错误: %v", err)
@@ -634,6 +673,44 @@ func TestMockDevice_CaliValveByMbus(t *testing.T) {
 	}
 }
 
+// TestMockDevice_SetValveOpenpreByMbus 校验 mock 路径：
+//   - 范围校验：负数 / >100 / 边界外必须返回错误（不发任何通信）；
+//   - 合法值（含 0/100 边界）必须返回 nil；
+//   - 未 Connect 时即使参数合法也必须返回错误（与 CaliValveByMbus 对齐）。
+func TestMockDevice_SetValveOpenpreByMbus(t *testing.T) {
+	d := NewMockDevice()
+	ctx := context.Background()
+
+	// 范围外
+	for _, bad := range []int{-1, -1000, 101, 256, 1000} {
+		if err := d.SetValveOpenpreByMbus(ctx, "262601300011", bad); err == nil {
+			t.Errorf("SetValveOpenpreByMbus(%d) 应返回错误", bad)
+		}
+	}
+
+	// 未 Connect：合法参数也必须报错（mock 路径顺序：参数校验 → 连接检查）
+	if err := d.SetValveOpenpreByMbus(ctx, "262601300011", 50); err == nil {
+		t.Error("未连接时 SetValveOpenpreByMbus 应返回错误")
+	}
+
+	if err := d.Connect(ctx, "COM9"); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	// 合法值（含 0/100 边界）
+	for _, good := range []int{0, 1, 50, 99, 100} {
+		if err := d.SetValveOpenpreByMbus(ctx, "262601300011", good); err != nil {
+			t.Errorf("SetValveOpenpreByMbus(%d) 意外错误: %v", good, err)
+		}
+	}
+
+	// ctx 取消：已连接时也应被 ctx 短路
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.SetValveOpenpreByMbus(ctxCancel, "262601300011", 50); !errors.Is(err, context.Canceled) {
+		t.Errorf("取消 ctx 应返回 context.Canceled, got %v", err)
+	}
+}
+
 func TestMockDevice_MbusReadInfo(t *testing.T) {
 	d := NewMockDevice()
 	ctx := context.Background()
@@ -679,6 +756,76 @@ func TestRealDevice_CaliValveByMbus_EndToEnd(t *testing.T) {
 	d.mu.Unlock()
 	if err := d.CaliValveByMbus(context.Background(), "262601300011"); err != nil {
 		t.Fatalf("CaliValveByMbus 端到端意外错误: %v", err)
+	}
+}
+
+// TestRealDevice_SetValveOpenpreByMbus_EndToEnd 校验 real 路径：构造 21
+// 字节 SET_VALVE 帧（含 open_pre + calc_day=30）→ 通过 fakePort 发送 →
+// 命中 19 字节 BB1F 响应返回成功。同时断言写到 fakePort 的帧字节 17 ==
+// open_pre、字节 18 == 30（calc_day），确认参数被正确编码进协议。
+func TestRealDevice_SetValveOpenpreByMbus_EndToEnd(t *testing.T) {
+	const openPre = 75
+	raw, _ := hex.DecodeString(buildTestSetValveResponse())
+	port := &fakePort{chunks: [][]byte{raw}}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+
+	if err := d.SetValveOpenpreByMbus(context.Background(), "262601300011", openPre); err != nil {
+		t.Fatalf("SetValveOpenpreByMbus 端到端意外错误: %v", err)
+	}
+
+	if len(port.written) != 1 {
+		t.Fatalf("expected 1 frame written, got %d", len(port.written))
+	}
+	written := port.written[0]
+	if len(written) != 21 {
+		t.Fatalf("written frame length = %d, want 21", len(written))
+	}
+	if written[14] != 0xbb || written[15] != 0x1f {
+		t.Errorf("cmd_id = %02x%02x, want bb1f", written[14], written[15])
+	}
+	if written[17] != byte(openPre) {
+		t.Errorf("open_pre byte = %02x, want %02x", written[17], openPre)
+	}
+	if written[18] != 30 {
+		t.Errorf("calc_day byte = %02x, want 1e (SetValveOpenpreByMbus Perl calc_day=30)", written[18])
+	}
+}
+
+// TestRealDevice_SetValveOpenpreByMbus_InvalidRange 校验范围校验在 real
+// 路径同样生效（不发任何字节）。test 用 real + fakePort 验证即使有
+// fakePort 在 ready 状态，范围外参数也必须先被拒绝。
+func TestRealDevice_SetValveOpenpreByMbus_InvalidRange(t *testing.T) {
+	port := &fakePort{}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	for _, bad := range []int{-1, 101, 1000} {
+		err := d.SetValveOpenpreByMbus(context.Background(), "262601300011", bad)
+		if err == nil {
+			t.Errorf("SetValveOpenpreByMbus(%d) 应返回错误", bad)
+			continue
+		}
+		if len(port.written) != 0 {
+			t.Errorf("范围外参数 (%d) 不应写入任何字节, got %d frame(s)", bad, len(port.written))
+			port.written = nil
+		}
+	}
+}
+
+// TestRealDevice_SetValveOpenpreByMbus_BadResponse 校验 slave 回非 BB1F
+// 格式时 SetValveOpenpreByMbus 返回错误（与 CaliValveByMbus 解析路径一致）。
+func TestRealDevice_SetValveOpenpreByMbus_BadResponse(t *testing.T) {
+	port := &fakePort{chunks: [][]byte{[]byte("FEFEFE6800000000000000000003BB1F0100FF15")}}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	if err := d.SetValveOpenpreByMbus(context.Background(), "262601300011", 50); err == nil {
+		t.Fatal("响应异常时应返回错误")
 	}
 }
 

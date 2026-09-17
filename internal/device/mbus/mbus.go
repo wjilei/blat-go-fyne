@@ -232,31 +232,65 @@ func (d *Device) MBusReadMotor(ctx context.Context, mac string) (string, error) 
 // UserValve.pm L632-638 CaliValveByMbus：open_pre=0, calc_day=255 触发
 // 重新校准）。用例侧用于 dev_normal_check_motor 启动电机前复位。
 //
-// 协议：cmd_id=BB1F（SET_VALVE）。mock 模式直接返回 nil；real 模式构造
-// 21 字节请求帧 → commandTrans → 校验 19 字节响应格式（`^\w{34}\w{2}16$`，
-// 对应 Perl _SetValveByMbus L617-621 命中即视为成功）。
+// 协议：cmd_id=BB1F（SET_VALVE），calc_day=255 是特殊值，固件视为重新校准。
+// 真实路径委托 setValveByMbus(0, 0xff)；mock 路径直接返回 nil（与既有行为
+// 一致）。详细协议说明见 setValveByMbus。
 func (d *Device) CaliValveByMbus(ctx context.Context, mac string) error {
 	d.mu.Lock()
 	mock := d.mock
 	connected := d.connected
-	port := d.port
 	d.mu.Unlock()
-
 	if mock {
 		if !connected {
 			return errNotConnected
 		}
 		return nil
 	}
+	return d.setValveByMbus(ctx, mac, 0, 0xff)
+}
+
+// SetValveOpenpreByMbus 通过 M-Bus 设置阀门开度（百分比），对应 Perl
+// UserValve.pm L624-630 SetValveOpenpreByMbus → _SetValveByMbus(addr,
+// open_pre, 30)：cmd_id=BB1F、calc_day=30（不重新校准，不重启设备）。
+//
+// openPre 必须在 [0,100] 范围内（含边界），否则返回错误且不发任何通信。
+// mock 模式：仅做连接检查 + ctx 取消短路；real 模式委托 setValveByMbus。
+func (d *Device) SetValveOpenpreByMbus(ctx context.Context, mac string, openPre int) error {
+	if openPre < 0 || openPre > 100 {
+		return fmt.Errorf("开度值必须在 0-100 之间: %d", openPre)
+	}
+	d.mu.Lock()
+	mock := d.mock
+	connected := d.connected
+	d.mu.Unlock()
+	if mock {
+		if !connected {
+			return errNotConnected
+		}
+		if err := ctxErr(ctx); err != nil {
+			return err
+		}
+		return nil
+	}
+	return d.setValveByMbus(ctx, mac, byte(openPre), 30)
+}
+
+// setValveByMbus 是 SET_VALVE（BB1F）的真实协议入口，对应 Perl UserValve.pm
+// L601-621 _SetValveByMbus：构造 21 字节请求帧 → commandTrans (timeout=3s,
+// retry=5，对齐 Perl L614) → 校验 19 字节响应格式（`^\w{34}\w{2}16$` 或
+// 短帧 0xE5 ACK）。CaliValveByMbus/SetValveOpenpreByMbus/RebootByMbus 等
+// 均通过本方法走真实路径，差异仅在 open_pre/calc_day 两个字节。
+func (d *Device) setValveByMbus(ctx context.Context, mac string, openPre, calcDay byte) error {
+	d.mu.Lock()
+	port := d.port
+	d.mu.Unlock()
 	if port == nil {
 		return errNotConnected
 	}
-
-	frame, err := buildSetValveFrame(mac, 0, 0xff)
+	frame, err := buildSetValveFrame(mac, openPre, calcDay)
 	if err != nil {
 		return err
 	}
-	// Perl _SetValveByMbus L614: timeout=>3, retry=>5
 	ret, err := d.commandTrans(ctx, port, frame, 3*time.Second, 5)
 	if err != nil {
 		return err
@@ -264,7 +298,7 @@ func (d *Device) CaliValveByMbus(ctx context.Context, mac string) error {
 	if err := parseSetValveResponse(ret); err != nil {
 		return err
 	}
-	d.logInfo(fmt.Sprintf("CaliValveByMbus 成功: %s", mac))
+	d.logInfo(fmt.Sprintf("setValveByMbus 成功: %s open_pre=%d calc_day=%d", mac, openPre, calcDay))
 	return nil
 }
 

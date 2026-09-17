@@ -410,6 +410,77 @@ func TestDisconnectMockKeepsStatus(t *testing.T) {
 	}
 }
 
+// TestSetValveOpeningMock 校验 mock SetValveOpening：参数范围校验 + 写入
+// openingPre 字段。范围外（负数 / >100）必须返回 error；合法值（含 0/100
+// 边界）必须成功且能通过 mockOpenPre() 读回。
+func TestSetValveOpeningMock(t *testing.T) {
+	d := NewMockDevice()
+
+	// 范围外：负数
+	if err := d.SetValveOpening(context.Background(), -1); err == nil {
+		t.Error("SetValveOpening(-1) 应返回 error")
+	}
+	// 范围外：>100
+	if err := d.SetValveOpening(context.Background(), 101); err == nil {
+		t.Error("SetValveOpening(101) 应返回 error")
+	}
+	// 范围外：极端值
+	for _, bad := range []int{-1000, 1000} {
+		if err := d.SetValveOpening(context.Background(), bad); err == nil {
+			t.Errorf("SetValveOpening(%d) 应返回 error", bad)
+		}
+	}
+
+	// 合法值（含 0/100 边界）
+	for _, good := range []int{0, 1, 50, 99, 100} {
+		if err := d.SetValveOpening(context.Background(), good); err != nil {
+			t.Errorf("SetValveOpening(%d) 返回 error: %v", good, err)
+		}
+		if got := d.mockOpenPre(); got != good {
+			t.Errorf("mockOpenPre() = %d, want %d", got, good)
+		}
+	}
+
+	// ctx 取消：mock 入口 ctxErr 必须在校验通过后短路返回。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.SetValveOpening(ctx, 50); !errors.Is(err, context.Canceled) {
+		t.Errorf("取消 ctx 应返回 context.Canceled, got %v", err)
+	}
+}
+
+// TestBuildSetConfigFrameSetValveOpening 校验 SetValveOpening 的真实路径：
+// 构造 SetConfig 帧，tag 8 (SetOpenPre) 必须为传入的 pre 值；tag 12 (CtrlType)
+// 必须不出现（不强制阀门动作，只设开度）。
+func TestBuildSetConfigFrameSetValveOpening(t *testing.T) {
+	now := time.Date(2026, 8, 6, 10, 30, 45, 0, time.Local)
+
+	for _, pre := range []int{0, 30, 100} {
+		p := DefaultSetConfigPayload(now)
+		p.SetOpenPre = intPtr(pre)
+		frame, err := buildSetConfigFrame("PSAV", p)
+		if err != nil {
+			t.Fatalf("buildSetConfigFrame: %v", err)
+		}
+		got := hex.EncodeToString(frame)
+		if len(got) < 4 || got[:4] != "01f9" {
+			t.Errorf("pre=%d hex = %q, want prefix \"01f9\"", pre, got)
+		}
+		var m map[int]int
+		if err := cbor.Unmarshal(frame[2:], &m); err != nil {
+			t.Fatalf("cbor.Unmarshal payload: %v", err)
+		}
+		if v, ok := m[8]; !ok {
+			t.Errorf("pre=%d tag 8 (SetOpenPre) 缺失", pre)
+		} else if v != pre {
+			t.Errorf("pre=%d tag 8 = %d, want %d", pre, v, pre)
+		}
+		if _, ok := m[12]; ok {
+			t.Errorf("pre=%d tag 12 (CtrlType) 不应出现（设开度无需 CtrlType）", pre)
+		}
+	}
+}
+
 // fakeAdvPayload 是用于测试 matchesBluetoothScanResult 的最小 AdvertisementPayload
 // 实现：仅 LocalName 有意义，其余方法返回零值（对齐 Perl export_test.go
 // 的 testAdvertisementPayload）。
