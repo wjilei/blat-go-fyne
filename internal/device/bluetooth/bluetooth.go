@@ -16,10 +16,13 @@
 //
 //   - mock（NewMockDevice / NewDevice）：内存假数据，无硬件可跑。
 //   - real（NewRealDevice）：tinygo.org/x/bluetooth 真实 BLE。
-//     所有真实 BLE 调用（Enable/Connect/Discover/Read/Write）都投递到
-//     一个专用串行 executor goroutine 依次执行，规避 Windows 上从非
-//     主线程并发调用 Connect/DiscoverServices/DiscoverCharacteristics/
-//     EnableNotifications 导致的崩溃（tinygo issue #294）。
+//     大多数 BLE 调用（Enable/Connect/Scan/Read/Write）通过专用串行
+//     executor goroutine 依次执行，规避 Windows 上从非主线程/并发调用
+//     导致的崩溃（tinygo issue #294）。GATT 服务/特征发现（DiscoverServices
+//     / DiscoverCharacteristics）单独包在 gate + 超时 goroutine 中，因为
+//     Windows 的 WinRT 这两个调用存在卡死风险：门闸互斥 + 超时熔断 +
+//     重试对齐 Perl BLAT goExtTools 7b1f4349 起的实现。卡死后所有 BLE
+//     入口快速失败并提示重启进程（Windows 无法在进程内复位 WinRT 栈）。
 package bluetooth
 
 import (
@@ -46,7 +49,7 @@ const (
 	charUUID16    = 0xfff2
 )
 
-// errNotConnected is returned when both Connect retries fail.
+// errNotConnected is returned when direct Connect + scan fallback both fail.
 var errNotConnected = errors.New("蓝牙连接失败")
 
 // errScanTimeout 是 Scan 兜底连接超时（15s，对应 Perl BLAT
@@ -61,6 +64,38 @@ var (
 	errNotifyTimeout    = errors.New("等待设备通知超时")
 	errSetConfigNack    = errors.New("蓝牙配置响应异常")
 )
+
+// GATT 发现时间/重试常量（对齐 Perl export.go 7b1f4349 起：
+// 升级 service 发现总预算 5s→16s，引入 service/characteristic 重试与退避）。
+const (
+	serviceDiscoveryTimeout             = 16 * time.Second
+	characteristicDiscoveryTimeout      = 5 * time.Second
+	gattDiscoveryGateTimeout            = 5 * time.Second
+	gattDiscoveryRetryDelay             = 250 * time.Millisecond
+	serviceDiscoveryRetryCount          = 3
+	characteristicDiscoveryRetryCount   = 8
+)
+
+// GATT 发现进程级门闸与 hung 状态。Windows 的 WinRT GATT 发现存在“卡死”
+// 风险（discoverServices/Characteristics 永不返回），Perl 工程为处理该风险
+// 在所有发现调用外加全局门闸（容量 1）+ hung 标记：超时的发现继续持有门闸
+// 直到 tinygo 真正返回；后续 acquire 超时则把进程标记为 hung，之后所有 BLE
+// 入口立即返回 errGattHung 并提示用户重启进程复位 BLE 栈。
+//
+// 我们沿用该设计：因为 3 工位共享 DefaultAdapter，且现有 executor 串行不
+// 保证发现返回（卡死时 executor 也会卡死），门闸互斥 + hung 熔断是必要的。
+var (
+	gattGate      = make(chan struct{}, 1)
+	gattMu        sync.Mutex
+	gattNextID    uint64
+	gattCurrentID uint64
+	gattHung      uint64
+)
+
+// errGattHung 在发现 hung 后被所有 BLE 入口返回；对应 Perl 的
+// "previous GATT discovery is still running; restart the process to
+// reset the Bluetooth stack"。Windows 上无法在进程内复位 WinRT 栈。
+var errGattHung = errors.New("GATT 发现已卡死（previous GATT discovery is still running）；请重启程序复位蓝牙栈")
 
 // Logger 是 bluetooth 包可选的日志输出接口（与 core.Logger 的 Info 兼容，
 // 不直接依赖 core 避免引入包级耦合）。nil 时静默跳过日志。
@@ -138,6 +173,11 @@ type Device struct {
 	// logger 是可选日志输出（SetLogger 注入，通常为 core.Logger 的 Info）。
 	// nil 时各成功日志静默跳过。
 	logger Logger
+
+	// debug 为 true 时（--debug）额外打印扫描到的每一个广播地址（MAC）与
+	// 广播名，便于排查"扫描到但没匹配上"的连接失败。默认 false，保持与
+	// Perl 原版一致的日志量；由 SetDebug 设置。
+	debug bool
 
 	// enableOnce 保证 adapter.Enable() 只执行一次：Windows 上重复
 	// RoInitialize 会返回 S_FALSE（0x1），go-ole 会把它当错误抛出。
@@ -218,6 +258,35 @@ func (d *Device) SetLogger(l Logger) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.logger = l
+}
+
+// SetDebug 设置 --debug 调试模式：true 时 scanAndConnect 会把扫描到的每个
+// 广播设备（MAC + 广播名）打到 logger，便于排查扫描匹配失败；false 时只
+// 打印命中目标后的日志（与 Perl 原版一致）。与 mbus.Device.SetDebug 对齐。
+func (d *Device) SetDebug(on bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.debug = on
+}
+
+// logDebug 仅在 debug 模式（--debug）下把 msg 打到 logger；否则静默。
+func (d *Device) logDebug(msg string) {
+	d.mu.Lock()
+	on := d.debug
+	d.mu.Unlock()
+	if on {
+		d.logInfo(msg)
+	}
+}
+
+// logScanResult 在 debug 模式下打印一个扫描到的广播设备；非 debug 静默。
+// name 为空时只打 MAC。
+func (d *Device) logScanResult(addr, name string) {
+	if name == "" {
+		d.logDebug(fmt.Sprintf("蓝牙扫描到设备: %s", addr))
+		return
+	}
+	d.logDebug(fmt.Sprintf("蓝牙扫描到设备: %s (name=%s)", addr, name))
 }
 
 // logInfo 输出一条日志；logger 为 nil 时静默跳过。蓝牙设备日志不带分类
@@ -319,54 +388,61 @@ func (d *Device) doConnect(id, mac string) error {
 	return nil
 }
 
-// realConnect 在真实模式下建立 BLE 连接。连接动作（Enable/Connect）必须
-// 在串行 executor goroutine 内执行；全部重试失败时返回 errNotConnected。
-func (d *Device) realConnect(ctx context.Context, id, mac string) error {
+// realConnect 在真实模式下建立 BLE 连接。流程对齐 Perl 7b1f4349
+// BlueToothScanAndConnect：
+//  1. 派生新格式 MAC（ParseIdToMac）+ legacy 兼容 MAC；
+//  2. 用新 MAC 直接 Connect（带 ConnectionTimeout=serviceDiscoveryTimeout）；
+//  3. 失败则进入 scanAndConnect 扫描兜底（同时匹配新 MAC 与 legacy MAC，
+//     legacy 用于兼容 ≤58 固件的旧设备）；
+//  4. 全部失败返回 errNotConnected。
+//
+// 连接动作必须在串行 executor goroutine 内执行；Perl 的外层 2 次重试已
+// 由“直接连接 + 扫描”两阶段取代，故此函数不做额外外层循环。
+func (d *Device) realConnect(ctx context.Context, id, newMac string) error {
 	// ParseMAC 是纯内存计算，不需要进 executor。
-	macAddr, err := bt.ParseMAC(mac)
+	macAddr, err := bt.ParseMAC(newMac)
 	if err != nil {
 		return errNotConnected
 	}
 	addr := bt.Address{MACAddress: bt.MACAddress{MAC: macAddr}}
-	for i := 0; i < 2; i++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		_, err := d.execCall(ctx, func() (any, error) {
-			return nil, d.realConnectLocked(addr, id, mac)
-		})
-		if err == nil {
-			return nil
-		}
+	if err := ctxErr(ctx); err != nil {
+		return err
 	}
-	return errNotConnected
+	_, err = d.execCall(ctx, func() (any, error) {
+		return nil, d.realConnectLocked(addr, id, newMac)
+	})
+	if err == nil {
+		return nil
+	}
+	return err
 }
 
 // realConnectLocked 必须在串行 executor goroutine 内调用。
-// 连接流程参照 Perl BLAT goExtTools 的 BlueToothScanAndConnect（export.go）：
-//  1. 先用解析出的 mac 地址直接 Connect；
-//  2. 直接连接失败则 adapter.Scan 广播扫描，回调里按地址/广播名匹配目标，
-//     匹配到后 StopScan 并把扫描到的地址回传；
-//  3. 用扫描到的地址再次 Connect。
-func (d *Device) realConnectLocked(addr bt.Address, id, mac string) error {
+// 连接流程对齐 Perl BLAT goExtTools 的 BlueToothScanAndConnect：
+//  1. adapter.Enable（只做一次，由 enableOnce 守卫）；
+//  2. 用新格式 MAC 直接 Connect（带 ConnectionTimeout）；
+//  3. 失败则 adapter.Scan 广播扫描，回调里按（新/旧）地址或大写广播名
+//     匹配目标，命中后 StopScan 并把扫描到的地址回传；
+//  4. 用扫描到的地址再次 Connect。
+func (d *Device) realConnectLocked(addr bt.Address, id, newMac string) error {
 	var enableErr error
 	d.enableOnce.Do(func() { enableErr = d.adapter.Enable() })
 	if enableErr != nil {
 		return enableErr
 	}
-	dev, err := d.adapter.Connect(addr, bt.ConnectionParams{})
+	dev, err := d.adapter.Connect(addr, bt.ConnectionParams{
+		ConnectionTimeout: bt.NewDuration(serviceDiscoveryTimeout),
+	})
 	if err == nil {
-		d.recordConnect(dev, id, mac)
+		d.recordConnect(dev, id, newMac)
 		return nil
 	}
-	// 直接连接失败 → 扫描兜底
-	dev, err = d.scanAndConnect(mac)
+	// 直接连接失败 → 扫描兜底（同时匹配新/旧 MAC）
+	dev, err = d.scanAndConnect(newMac, legacyMacFrom(newMac))
 	if err != nil {
 		return err
 	}
-	d.recordConnect(dev, id, mac)
+	d.recordConnect(dev, id, newMac)
 	return nil
 }
 
@@ -382,29 +458,49 @@ func (d *Device) recordConnect(dev bt.Device, id, mac string) {
 	d.logInfo(fmt.Sprintf("蓝牙连接成功: %s", mac))
 }
 
-// scanAndConnect 广播扫描目标设备并连接，对应 Perl BLAT
-// BlueToothScanAndConnect 的 Scan 分支（export.go L321-373）：
-//   - adapter.Scan 回调中按 mac 地址（大小写不敏感）或广播名匹配目标；
-//   - 匹配后 StopScan 并把扫描到的地址发回 chan；
-//   - 收到地址后用该地址 Connect；15s 超时未匹配返回 errScanTimeout。
+// scanAndConnect 广播扫描目标设备并连接，对齐 Perl BLAT 7b1f4349+acc5c47f：
+//   - adapter.Scan 回调中按（uppercased）地址或 legacy 地址匹配，或 uppercased
+//     广播名匹配新格式目标 MAC；
+//   - 命中后用 CompareAndSwap 防止并发匹配时重复发地址 + 重复 StopScan
+//     （Perl L323 引入，避免小概率下的双重 connect）；
+//   - 收到地址后用该地址 Connect（ConnectionTimeout=serviceDiscoveryTimeout）；
+//   - 15s 整体超时未匹配返回 errScanTimeout。
+//
+// debug 模式（--debug）下额外打印扫描到的每个广播设备 MAC（+广播名）。
 //
 // 必须在串行 executor goroutine 内调用。
-func (d *Device) scanAndConnect(mac string) (bt.Device, error) {
+func (d *Device) scanAndConnect(targetMac, legacyMac string) (bt.Device, error) {
+	target := strings.ToUpper(targetMac)
+	legacy := strings.ToUpper(legacyMac)
 	addrChan := make(chan bt.Address, 1)
 	scanErrChan := make(chan error, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), serviceDiscoveryTimeout)
 	defer cancel()
+
+	d.logDebug(fmt.Sprintf("蓝牙扫描开始（直接连接失败，走扫描兜底），目标地址 %s 兼容地址 %s", target, legacy))
 
 	var scanMatched atomic.Bool
 	go func() {
 		err := d.adapter.Scan(func(a *bt.Adapter, sr bt.ScanResult) {
-			if scanResultMatches(mac, sr.Address.String(), sr.LocalName()) {
-				scanMatched.Store(true)
-				_ = d.adapter.StopScan()
-				addrChan <- sr.Address
+			addr := sr.Address.String()
+			name := sr.LocalName()
+			// debug 模式：打印每个扫描到的设备 MAC（+广播名），便于定位
+			// "扫描到但匹配不上" 的序列号/mac 派生问题。
+			d.logScanResult(addr, name)
+			if !matchesBluetoothScanResult(sr, target, legacy) {
+				return
+			}
+			if !scanMatched.CompareAndSwap(false, true) {
+				return
+			}
+			addrChan <- sr.Address
+			if err := a.StopScan(); err != nil {
+				d.logInfo(fmt.Sprintf("StopScan 失败: %v", err))
 			}
 		})
-		if err != nil && !scanMatched.Load() {
+		if err != nil {
+			// Perl 7b1f4349 后不再 `&& !scanMatched.Load()` 短路：scanErrChan
+			// 已用缓冲 1，重复错误只记录一次。
 			select {
 			case scanErrChan <- err:
 			default:
@@ -415,26 +511,49 @@ func (d *Device) scanAndConnect(mac string) (bt.Device, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			_ = d.adapter.StopScan()
+			// Perl: StopScan 仅在未匹配时记录错误（防止与已发出的 StopScan
+			// 双重报错）。
+			if err := d.adapter.StopScan(); err != nil && !scanMatched.Load() {
+				d.logInfo(fmt.Sprintf("StopScan 失败: %v", err))
+			}
 			return bt.Device{}, errScanTimeout
 		case err := <-scanErrChan:
 			_ = d.adapter.StopScan()
 			return bt.Device{}, err
 		case addr := <-addrChan:
 			d.logInfo(fmt.Sprintf("蓝牙扫描成功，发现目标设备 %s，开始连接", addr.String()))
-			dev, err := d.adapter.Connect(addr, bt.ConnectionParams{})
+			device, err := d.adapter.Connect(addr, bt.ConnectionParams{
+				ConnectionTimeout: bt.NewDuration(serviceDiscoveryTimeout),
+			})
 			if err != nil {
 				return bt.Device{}, err
 			}
-			return dev, nil
+			return device, nil
 		}
 	}
 }
 
-// scanResultMatches 判断扫描结果是否命中目标设备：mac 地址大小写不敏感
-// 匹配，或广播名精确匹配（对应 BLAT export.go L324-325 的回调判断）。
-func scanResultMatches(target, addr, name string) bool {
-	return strings.EqualFold(addr, target) || name == target
+// matchesBluetoothScanResult 判断扫描结果是否命中目标设备（对齐 Perl
+// 7b1f4349+acc5c47f）：
+//   - 广播地址大小写不敏感匹配 targetUpperMAC（新格式）或 legacyUpperMAC
+//     （≤58 固件的旧 FC:E8:92 格式）；
+//   - 广播名**大写**后等于 targetUpperMAC（acc5c47f 起显式大写匹配）。
+//
+// 旧 target 是小写/混合大小写也可能命中，因为两侧都 ToUpper。广播名匹配
+// 仅针对新格式 MAC（Perl 9-13 行注释：legacy 旧设备只在地址层匹配）。
+//
+// AdvertisementPayload 可能为 nil（嵌入接口字段，测试中可以构造空
+// ScanResult；生产由 tinygo 平台层保证非 nil）。这里显式短路 nil 避免
+// 在 promoted 方法上 panic。
+func matchesBluetoothScanResult(sr bt.ScanResult, targetUpperMAC, legacyUpperMAC string) bool {
+	discoveredMAC := strings.ToUpper(sr.Address.String())
+	if discoveredMAC == targetUpperMAC || discoveredMAC == legacyUpperMAC {
+		return true
+	}
+	if sr.AdvertisementPayload == nil {
+		return false
+	}
+	return strings.ToUpper(sr.LocalName()) == targetUpperMAC
 }
 
 // Reboot restarts the device. Mock always succeeds and records the time
@@ -606,7 +725,16 @@ func (d *Device) startExec() {
 // execCall 把 fn 投递到串行 executor 并同步等待结果，遵守 ctx 取消。
 // 返回 fn 的 (值, 错误)。fn 中允许调用任意 tinygo BLE API——它们只在
 // 单 goroutine 内串行执行，规避 Windows 并发 BLE 调用崩溃。
+//
+// 当 GATT 发现已 hung（Windows 上无法在进程内复位 WinRT 栈）时，execCall
+// 立即返回 errGattHung 而不投递 fn，避免与仍可能卡在 tinygo 内的 abandoned
+// discovery goroutine 产生并发调用。Perl BlueToothScanAndConnect 对所有发现
+// 入口做了同样的熔断；我们扩展到所有 BLE 入口（含 Connect/Read/Write）以
+// 杜绝交叉并发风险。
 func (d *Device) execCall(ctx context.Context, fn func() (any, error)) (any, error) {
+	if isGattDiscoveryHung() {
+		return nil, errGattHung
+	}
 	d.startExec()
 	reply := make(chan execResult, 1)
 	select {
@@ -625,9 +753,293 @@ func (d *Device) execCall(ctx context.Context, fn func() (any, error)) (any, err
 	}
 }
 
+// isGattDiscoveryHung 返回 GATT 发现是否已 hung 熔断（true 时 execCall 拒绝）。
+func isGattDiscoveryHung() bool {
+	gattMu.Lock()
+	defer gattMu.Unlock()
+	return gattHung != 0
+}
+
 type execResult struct {
 	val any
 	err error
+}
+
+// ---- GATT 发现门闸（对齐 Perl export.go acquireGattDiscoveryGate）----
+
+// acquireGattDiscoveryGate 申请一次 GATT 发现令牌。互斥保证同一时刻只有
+// 一个 tinygo DiscoverServices/Characteristics 在跑（避免 Windows 并发 GATT
+// 调用崩溃）；hung 状态下立即返回 errGattHung；acquire 超时则把当前持有
+// 的 discovery 标记为 hung（Perl L579-580 同语义）。
+//
+// 必须在 executor 内调用或同步等待前完成 hung 检查（通过 isGattDiscoveryHung
+// 守门）。
+func acquireGattDiscoveryGate(timeout time.Duration) (uint64, func(), error) {
+	gattMu.Lock()
+	if gattHung != 0 {
+		gattMu.Unlock()
+		return 0, nil, errGattHung
+	}
+	gattMu.Unlock()
+
+	if timeout <= 0 {
+		timeout = gattDiscoveryGateTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case gattGate <- struct{}{}:
+		gattMu.Lock()
+		gattNextID++
+		id := gattNextID
+		gattCurrentID = id
+		gattMu.Unlock()
+		return id, func() {
+			gattMu.Lock()
+			if gattCurrentID == id {
+				gattCurrentID = 0
+			}
+			// 仅清本 id 的 hung；hung 由 markGattDiscoveryHung 显式置位。
+			gattMu.Unlock()
+			<-gattGate
+		}, nil
+	case <-timer.C:
+		// 门闸 5s 内拿不到：当前持有者大概率卡死（tinygo discover 调用
+		// 永不返回），按 Perl 语义 mark 为 hung 永久熔断。
+		if markGattDiscoveryHung(0) {
+			return 0, nil, fmt.Errorf("previous GATT discovery still running after %s", timeout)
+		}
+		return 0, nil, errGattHung
+	}
+}
+
+// markGattDiscoveryHung 标记 GATT 发现 hung（Windows WinRT 卡死）。id>0
+// 时仅当其等于当前持有 id 才置位；id==0 用于 acquire 超时路径的无条件置
+// 位（Perl markGattDiscoveryHung(id) 返回 false 时代表已被其它协程 reset）。
+func markGattDiscoveryHung(id uint64) bool {
+	gattMu.Lock()
+	defer gattMu.Unlock()
+	if id != 0 && gattCurrentID != id {
+		return false
+	}
+	gattHung++
+	return true
+}
+
+// discoverServices 定位 GATT 服务，带超时与门闸互斥。对齐 Perl export.go
+// discoverServices：把 tinygo DiscoverServices 投递到独立 goroutine，select
+// 等待结果；超时则 mark hung 并返回 "service discovery failed: timeout
+// after %s"（该串被 isRetryableGattDiscoveryError 识别以触发重试）。
+//
+// 不在 executor 内调用（必须由 findCharacteristicWithRetry 在 executor 内调
+// 用）；goroutine 仅承载 tinygo 调用，不做其它共享状态写。
+func discoverServices(device *bt.Device, svcUUID uint16, timeout time.Duration) ([]bt.DeviceService, error) {
+	if timeout <= 0 {
+		timeout = serviceDiscoveryTimeout
+	}
+	discoveryID, releaseGate, err := acquireGattDiscoveryGate(gattDiscoveryGateTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("service discovery failed: %w", err)
+	}
+
+	resultChan := make(chan struct {
+		services []bt.DeviceService
+		err      error
+	}, 1)
+	go func() {
+		defer releaseGate()
+		svcs, gerr := device.DiscoverServices([]bt.UUID{bt.New16BitUUID(svcUUID)})
+		select {
+		case resultChan <- struct {
+			services []bt.DeviceService
+			err      error
+		}{svcs, gerr}:
+		default:
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	select {
+	case r := <-resultChan:
+		return r.services, r.err
+	case <-ctx.Done():
+		// 给 goroutine 一点时间把结果补发到 resultChan，避免与 hung 标记竞态。
+		select {
+		case r := <-resultChan:
+			return r.services, r.err
+		default:
+		}
+		markGattDiscoveryHung(discoveryID)
+		return nil, fmt.Errorf("service discovery failed: timeout after %s", timeout)
+	}
+}
+
+// discoverCharacteristic 定位 GATT 特征，带超时与门闸互斥。对齐 Perl
+// export.go discoverCharacteristic：返回切片（空切片 → errNoCharacteristic），
+// 超时则 mark hung 并返回 "characteristics discovery failed: timeout
+// after %s"（该串被 isRetryableGattDiscoveryError 识别以触发重试）。
+func discoverCharacteristic(svc bt.DeviceService, charUUID uint16, timeout time.Duration) ([]bt.DeviceCharacteristic, error) {
+	if timeout <= 0 {
+		timeout = characteristicDiscoveryTimeout
+	}
+	discoveryID, releaseGate, err := acquireGattDiscoveryGate(gattDiscoveryGateTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("characteristics discovery failed: %w", err)
+	}
+
+	resultChan := make(chan struct {
+		chars []bt.DeviceCharacteristic
+		err   error
+	}, 1)
+	go func() {
+		defer releaseGate()
+		chars, gerr := svc.DiscoverCharacteristics([]bt.UUID{bt.New16BitUUID(charUUID)})
+		select {
+		case resultChan <- struct {
+			chars []bt.DeviceCharacteristic
+			err   error
+		}{chars, gerr}:
+		default:
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	select {
+	case r := <-resultChan:
+		if r.err != nil {
+			return nil, r.err
+		}
+		if len(r.chars) == 0 {
+			return nil, errNoCharacteristic
+		}
+		return r.chars, nil
+	case <-ctx.Done():
+		select {
+		case r := <-resultChan:
+			if r.err != nil {
+				return nil, r.err
+			}
+			if len(r.chars) == 0 {
+				return nil, errNoCharacteristic
+			}
+			return r.chars, nil
+		default:
+		}
+		markGattDiscoveryHung(discoveryID)
+		return nil, fmt.Errorf("characteristics discovery failed: timeout after %s", timeout)
+	}
+}
+
+// discoverServicesWithRetryUntil 在总预算 deadline 内按
+// serviceDiscoveryRetryCount 次数重试服务发现，每次尝试 sleepUntil 退避。
+// isRetryableGattDiscoveryError 判定是否值得重试；非可重试错误或达到上限
+// 立即退出。错误串来自 Perl export.go 对齐：tinygo v0.15.0 在
+// gattc_windows.go:71 / adapter_windows.go:63 / gattc_windows.go:274 仍
+// 命中本项目匹配模式。
+func discoverServicesWithRetryUntil(device *bt.Device, svcUUID uint16, deadline time.Time) ([]bt.DeviceService, error) {
+	var lastErr error
+	for attempt := 1; attempt <= serviceDiscoveryRetryCount; attempt++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		svcs, err := discoverServices(device, svcUUID, minDuration(serviceDiscoveryTimeout, remaining))
+		if err == nil {
+			return svcs, nil
+		}
+		lastErr = err
+		if !isRetryableGattDiscoveryError(err) || attempt == serviceDiscoveryRetryCount {
+			break
+		}
+		time.Sleep(gattDiscoveryRetryDelay * time.Duration(attempt))
+		if time.Until(deadline) <= 0 {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = context.DeadlineExceeded
+	}
+	return nil, lastErr
+}
+
+// findCharacteristicWithRetry 端到端服务+特征发现重试：对齐 Perl
+// export.go findCharacteristicWithRetry。
+//   - 总预算 deadline = now + serviceDiscoveryTimeout（16s）；
+//   - characteristicDiscoveryRetryCount（8）次外层循环；
+//   - 每次先 discoverServicesWithRetryUntil（内部再 serviceDiscoveryRetryCount=3
+//     次重试），拿到服务后再用剩余时间 discoverCharacteristic；
+//   - 可重试错误（isRetryableGattDiscoveryError）按 250ms*attempt 退避后
+//     重试；hung/非可重试错误立即返回。
+func findCharacteristicWithRetry(device *bt.Device, svcUUID, charUUID uint16) (bt.DeviceCharacteristic, error) {
+	var lastErr error
+	deadline := time.Now().Add(serviceDiscoveryTimeout)
+	for attempt := 1; attempt <= characteristicDiscoveryRetryCount; attempt++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		svcs, err := discoverServicesWithRetryUntil(device, svcUUID, deadline)
+		if err != nil {
+			lastErr = err
+		} else if len(svcs) == 0 {
+			lastErr = errNoService
+		} else {
+			remaining = time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			chars, cerr := discoverCharacteristic(svcs[0], charUUID, minDuration(characteristicDiscoveryTimeout, remaining))
+			if cerr == nil {
+				if len(chars) == 0 {
+					lastErr = errNoCharacteristic
+				} else {
+					return chars[0], nil
+				}
+			} else {
+				lastErr = cerr
+			}
+		}
+
+		if !isRetryableGattDiscoveryError(lastErr) || attempt == characteristicDiscoveryRetryCount {
+			break
+		}
+		time.Sleep(gattDiscoveryRetryDelay * time.Duration(attempt))
+		if time.Until(deadline) <= 0 {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = context.DeadlineExceeded
+	}
+	return bt.DeviceCharacteristic{}, lastErr
+}
+
+// minDuration 返回两 duration 的较小值。
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// isRetryableGattDiscoveryError 判定 GATT 发现错误是否值得重试。对齐
+// Perl export.go isRetryableGattDiscoveryError：错误串来自 tinygo
+// v0.15.0 Windows 后端（gattc_windows.go:71 "operation failed with code %d"、
+// gattc_windows.go:274 "did not find all requested characteristic"、
+// adapter_windows.go:63 "async operation failed with status %d"）；其它
+// 两条由本包自身的超时/门闸错误生成。
+func isRetryableGattDiscoveryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "operation failed with code 1") ||
+		strings.Contains(msg, "async operation failed with status 2") ||
+		strings.Contains(msg, "did not find all requested characteristic") ||
+		strings.Contains(msg, "discovery failed: timeout after") ||
+		strings.Contains(msg, "previous gatt discovery is still running")
 }
 
 // ---- GATT 通信层（均须在串行 executor goroutine 内调用）----
@@ -635,6 +1047,11 @@ type execResult struct {
 // ensureWriteChar 定位服务（0xfff0）/特征（0xfff2，读写同一特征）并缓存
 // writeChar，首次通信时 EnableNotifications 把通知字节推入 d.notifCh。
 // 之后复用缓存（对应 Perl 缓存的 BleCharac）。
+//
+// 服务/特征发现走 findCharacteristicWithRetry（gate + 超时 + 重试）。
+// 该函数本身在 executor 内运行（被 writeAndRecv 间接调用），但其内部真
+// 正的 tinygo DiscoverServices/Characteristics 调用位于独立 goroutine（被
+// 门闸互斥）；详见 discoverServices/discoverCharacteristic。
 func (d *Device) ensureWriteChar() error {
 	d.mu.Lock()
 	cached := d.charCached
@@ -645,11 +1062,8 @@ func (d *Device) ensureWriteChar() error {
 	if d.tinyDev == nil {
 		return errNotConnected
 	}
-	svc, err := d.findService()
-	if err != nil {
-		return err
-	}
-	ch, err := d.findCharacteristic(svc)
+	dev := d.tinyDev
+	ch, err := findCharacteristicWithRetry(dev, serviceUUID16, charUUID16)
 	if err != nil {
 		return err
 	}
@@ -735,8 +1149,12 @@ drain:
 
 // findService 定位 GATT 服务（常量 0xfff0，对应 Perl BLAT
 // FindCharacteristicToOperator 的服务过滤）。
+//
+// 不再由 Device 直连：服务发现已纳入 findCharacteristicWithRetry 流程（服
+// 务+特征一次性发现，含重试）。此函数仅保留以兼容历史调用路径
+// （当前代码无外部调用）。
 func (d *Device) findService() (bt.DeviceService, error) {
-	svcs, err := d.tinyDev.DiscoverServices([]bt.UUID{bt.New16BitUUID(serviceUUID16)})
+	svcs, err := discoverServices(d.tinyDev, serviceUUID16, serviceDiscoveryTimeout)
 	if err != nil {
 		return bt.DeviceService{}, err
 	}
@@ -749,7 +1167,7 @@ func (d *Device) findService() (bt.DeviceService, error) {
 
 // findCharacteristic 在 svc 内定位特征（常量 0xfff2，读写同一特征）。
 func (d *Device) findCharacteristic(svc bt.DeviceService) (bt.DeviceCharacteristic, error) {
-	chars, err := svc.DiscoverCharacteristics([]bt.UUID{bt.New16BitUUID(charUUID16)})
+	chars, err := discoverCharacteristic(svc, charUUID16, characteristicDiscoveryTimeout)
 	if err != nil {
 		return bt.DeviceCharacteristic{}, err
 	}
@@ -973,19 +1391,47 @@ func setConfigOK(raw []byte) bool {
 
 // ---- id 到 BLE 地址的派生（对应 Perl BLAT::Common::Utils::parseIdToMac）----
 
-// ParseIdToMac 把设备序列号 id 派生为 BLE 广播地址（FC:E8:92:XX:XX:XX）。
-// 精确复现 Perl 的 parseIdToMac：id 从末尾起每 2 个字符一组做 hex 解析
-// 填满 16 字节数组（高位补 0），再做 times33（djb2）哈希，取哈希低 24 位
-// 作为 MAC 后三字节。Go 侧用 uint64 自然溢出：由于最终只取低 24 位，
-// 与 Perl Math::BigInt 无限精度结果一致（2^64 ≡ 0 mod 2^24）。
-func ParseIdToMac(id string) string {
+// idMacHash 复现 Perl _hashTimes33（Math::BigInt 无限精度）的截断结果：
+// 取 uint64 自然溢出后的值。Perl 取哈希低 24 位（旧格式）/ 低 40 位（新格式）
+// 时，低 40 位与 Go 截断后低 40 位一致（2^40 整除 2^64）。start=5381
+// （djb2 初值），hash = hash*33 + v，v 来自 id2MacArray。
+func idMacHash(id string) uint64 {
 	arr := id2MacArray(id)
-	hash := uint64(5381)
+	h := uint64(5381)
 	for _, v := range arr {
-		hash = hash<<5 + hash + uint64(v)
+		h = h<<5 + h + v
 	}
+	return h
+}
+
+// ParseIdToMac 把设备序列号 id 派生为**新格式** BLE 广播地址
+//（FC:XX:XX:XX:XX:XX，共 5 字节哈希）。对应 Perl 7b1f4349 升级后的
+// parseIdToMac：新格式比旧格式（FC:E8:92: + 3 字节）多算 2 字节以减小
+// 哈希冲突概率。Go 侧从截断 uint64 中取低 40 位（5 字节），与 Perl
+// Math::BigInt 无限精度结果等价（2^40 | 2^64）。
+func ParseIdToMac(id string) string {
+	h := idMacHash(id)
+	return fmt.Sprintf("FC:%02X:%02X:%02X:%02X:%02X",
+		byte(h>>32), byte(h>>24), byte(h>>16), byte(h>>8), byte(h))
+}
+
+// ParseIdToMacOld 派生旧格式 BLE 地址（FC:E8:92:XX:XX:XX，3 字节哈希），
+// 对应 Perl parseIdToMacOld。保留用于兼容 ≤58 固件的旧设备；Connect
+// 内部会在扫描匹配阶段同时尝试新+旧 MAC，但不会直接连旧 MAC。
+func ParseIdToMacOld(id string) string {
+	h := idMacHash(id)
 	return fmt.Sprintf("FC:E8:92:%02X:%02X:%02X",
-		(hash>>16)&0xff, (hash>>8)&0xff, hash&0xff)
+		byte(h>>16), byte(h>>8), byte(h))
+}
+
+// legacyMacFrom 由新格式 MAC 派生兼容用旧 MAC（"FC:E8:92:" + 新 MAC 的
+// 低 3 字节）。len ≤ 12 时返回空串（输入非完整 5 字节 MAC），对齐 Perl
+// BlueToothScanAndConnect 的 len(targetUpperMAC) <= 12 短路。
+func legacyMacFrom(target string) string {
+	if len(target) <= 12 {
+		return ""
+	}
+	return "FC:E8:92:" + target[9:]
 }
 
 // id2MacArray 复现 Perl _id2MacArray：从 id 末尾起每 2 字符一组（substr

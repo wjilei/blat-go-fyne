@@ -252,11 +252,18 @@ func _ensureBluetooth(ctx context.Context, env *core.Env, deviceType string) (*b
 
 	id := _str(heatnote, "serial")
 
-	// mac 由序列号 parseIdToMac 派生；已连接则跳过重复连接，否则重试连接
-	// （Device.Connect 内部最多重试 2 次，对应 Perl ConnectBle 重试）。
+	// mac 由序列号 parseIdToMac 派生（新格式 FC:XX:XX:XX:XX:XX，对齐 Perl
+	// 7b1f4349 升级）；已连接则跳过重复连接，否则 Connect 内部走
+	// “直接连接 → 扫描兜底” 两阶段（扫描同时匹配新/旧 MAC 兼容 ≤58
+	// 固件），不再有外层重试——重试已下沉到 GATT 发现层。
 	bt.SetDevType(deviceType)
 	// 注入日志输出：发现服务/特征成功、扫描成功、连接成功都会打日志
 	bt.SetLogger(env.Log)
+	// --debug 模式：打印蓝牙扫描到的每个设备 MAC（+广播名），便于排查
+	// "扫描到但匹配不上"（默认 false 与 Perl 行为一致，同 _ensureMBUS）。
+	if debug, _ := heatnote["debug"].(bool); debug {
+		bt.SetDebug(true)
+	}
 
 	env.Log.Info("", "扫描并连接蓝牙")
 	mac := bluetooth.ParseIdToMac(id)

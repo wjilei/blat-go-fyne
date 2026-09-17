@@ -158,6 +158,10 @@ func main() {
 	// 还是 real mbus 设备。HeatNote 键小写 "mbus_mock" 存 bool（与
 	// wire_valve_mbus.go _ensureMBUS 的读取键一致）。
 	heatnote["mbus_mock"] = *mockMBus
+	// 注入 --debug 调试标志：case 端（_ensureBluetooth / _ensureMBUS）据此
+	// 打开设备侧调试日志（蓝牙扫描到的每个 MAC、MBus 收发 hex）。
+	// 与 bt_mock/mbus_mock 一样只存内存，不写盘。
+	heatnote["debug"] = *debug
 
 	// 当前计划文件路径写入 env.Vars["HeatNote"]["plan"]，case 运行时据此
 	// 做计划判断；未传 --plan 时删除历史残留键（GUI 模式由下拉框接管该值）。
