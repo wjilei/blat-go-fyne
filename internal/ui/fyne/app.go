@@ -237,6 +237,15 @@ type App struct {
 	// 受 mu 保护（startStation 登记、goroutine 结束清空、stopStation /
 	// switchMode / stopAllStations 读取）。
 	stationRuns []*stationRun
+	// stationMBUS 是每工位长期持有的 M-Bus 设备缓存（下标 0..2 对应设备1..3）。
+	// 同工位同串口同 mock 模式跨轮复用已连接设备，避免每轮 deepCopyVars
+	// 删除 mbus_dev 后新建 Device 重开同一串口报 Access is denied；只有配置
+	//（串口/模式）变化或应用关闭（stopAllStations）时才 Disconnect。受 mu 保护。
+	stationMBUS []*stationMBUS
+	// stationsClosing 是关窗标记：true 表示应用正在关闭，禁止新工位启动、
+	// 禁止把 M-Bus 设备写回缓存（应改为直接 Disconnect）。由 stopAllStations
+	// 置位，受 mu 保护。
+	stationsClosing bool
 	// suppressPlanSel 是计划下拉框回退 guard：switchMode 拒绝后
 	// SetSelected(old) 触发的 onPlanSelected 回调直接吞掉，避免递归加载
 	// 旧计划（连带 stopIfRunning 强停当前 run）。受 mu 保护。

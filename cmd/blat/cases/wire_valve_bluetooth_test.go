@@ -20,6 +20,12 @@ type fakeUI struct {
 	confirmErr error
 	confirmMsg string
 	confirmN   int
+
+	// Message（弹框 2：等电机转完点确认）相关字段
+	messageErr   error
+	messageLast  string
+	messageN     int
+	messageDanger bool
 }
 
 func (f *fakeUI) Info(category, msg string) {}
@@ -30,7 +36,14 @@ func (f *fakeUI) Prompt(ctx context.Context, label, def string) (string, error) 
 
 func (f *fakeUI) WaitContinue(ctx context.Context, msg string) error { return nil }
 
-func (f *fakeUI) Message(ctx context.Context, msg string, danger bool) error { return nil }
+func (f *fakeUI) Message(ctx context.Context, msg string, danger bool) error {
+	f.mu.Lock()
+	f.messageLast = msg
+	f.messageN++
+	f.messageDanger = danger
+	f.mu.Unlock()
+	return f.messageErr
+}
 
 func (f *fakeUI) Confirm(ctx context.Context, msg string, danger bool) (bool, error) {
 	f.mu.Lock()

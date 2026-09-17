@@ -1,0 +1,65 @@
+19:48:54,829 INFO  - 设备1 bootStation: 复用 M-Bus 连接 COM27
+19:48:54,829 INFO  - 设备1 bootStation: RunPlan 开始
+19:48:54,830 INFO RUNNER - case_start HeatSuite::wire_valve_mbus_read_motor key_state: "09"
+19:48:57,106 INFO  - setValveByMbus 成功: 222222430003 open_pre=80 calc_day=30
+19:48:59,428 INFO  - 已确认电机开始转动（开度 80%）
+19:49:07,927 INFO  - 用户已确认电机转到 80%，准备恢复开度到 100%
+19:49:10,188 INFO  - setValveByMbus 成功: 222222430003 open_pre=100 calc_day=30
+19:49:10,188 WARN  - 已恢复开度到 100%，请等电机转完再断电
+19:49:10,188 INFO RUNNER - case_stop HeatSuite::wire_valve_mbus_read_motor ok 15.36
+19:49:10,188 INFO TAP - ok 1 - M-Bus 电机启动状态检查
+19:49:10,189 INFO  - SaveTestData POST https://blat.poersmart.com/v1/tests/records?dev_type=2 test_result=1 serial_num=222222430003 last_start_time=1789645734 log_bytes=737
+19:49:10,189 INFO  - debug 模式，不保存测试记录，三段式 YAML 如下:
+---
+summary:
+    test_total_num: 1
+    test_planed_num: 1
+    test_runing_num: 0
+    test_ok_num: 1
+    test_fail_num: 0
+    test_result: 1
+    test_failreason: ok
+    test_total_time: "15.36"
+    start_time: "2026-09-17T19:48:54+08:00"
+    stop_time: "2026-09-17T19:49:10+08:00"
+---
+HeatNote:
+    bt_mock: false
+    debug: true
+    mbus:
+        baudRate: 2400
+        parity: even
+        port: COM27
+    mbus_dev: {}
+    mbus_mock: false
+    plan: confs/plan_PTVB1_normal_ut_checkmotor.yml
+    serial: "222222430003"
+    test_mode: normal_ut_checkmotor
+TEST_WORKSTATION: 工位84
+---
+- case_seq: 1
+  name: HeatSuite::wire_valve_mbus_read_motor
+  title: M-Bus 电机启动状态检查
+  result: ok
+  time: 15.3576051
+  key_state: "09"
+
+19:49:10,189 INFO  - debug 模式，不保存测试记录，上报数据如下:
+{
+  "fail_reason": "ok",
+  "last_start_time": 1789645734,
+  "log": "---\nsummary:\n    test_total_num: 1\n    test_planed_num: 1\n    test_runing_num: 0\n    test_ok_num: 1\n    test_fail_num: 0\n    test_result: 1\n    test_failreason: ok\n    test_total_time: \"15.36\"\n    start_time: \"2026-09-17T19:48:54+08:00\"\n    stop_time: \"2026-09-17T19:49:10+08:00\"\n---\nHeatNote:\n    bt_mock: false\n    debug: true\n    mbus:\n        baudRate: 2400\n        parity: even\n        port: COM27\n    mbus_dev: {}\n    mbus_mock: false\n    plan: confs/plan_PTVB1_normal_ut_checkmotor.yml\n    serial: \"222222430003\"\n    test_mode: normal_ut_checkmotor\nTEST_WORKSTATION: 工位84\n---\n- case_seq: 1\n  name: HeatSuite::wire_valve_mbus_read_motor\n  title: M-Bus 电机启动状态检查\n  result: ok\n  time: 15.3576051\n  key_state: \"09\"\n",
+  "lot": "",
+  "model": "",
+  "pn": "",
+  "serial_num": "222222430003",
+  "tenant_id": "",
+  "test_mode": "normal_ut_checkmotor",
+  "test_result": 1,
+  "test_type": "normal",
+  "tool_version": "",
+  "user": "",
+  "workstation": "工位84"
+}
+19:49:10,189 INFO  - 设备1 bootStation: RunPlan 返回 err=<nil>
+19:49:10,189 INFO  - 设备1 bootStation: M-Bus 缓存已更新 COM27

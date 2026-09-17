@@ -4,56 +4,71 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"blat/internal/core"
 	"blat/internal/device/mbus"
 )
 
 // WireValveMBusReadMotorCase 翻译自 Perl
-// BLAT::APP::Heat::Cases::wire_valve::dev_normal_check_motor。
-// 流程：
-//  1. 通过 M-Bus 发起电机校准（CaliValveByMbus）；
-//  2. 轮询读取电机状态，与期望值比对；未达期望则按轮询间隔重试；
-//  3. 轮询成功后 sleep 1s，再读一次设备信息，校验 alarm==0 确认状态
-//     已保存。
+// BLAT::APP::Heat::Cases::wire_valve::dev_normal_check_motor 的"两阶段
+// 开度人工确认"变体。流程：
+//  1. 通过 M-Bus 设置阀门开度到 step1Open（默认 80）；
+//  2. 弹框询问用户确认电机已开始转动；
+//  3. 弹框提示用户等电机转完到目标位置后手动点确认；
+//  4. 再次设置阀门开度到 step2Open（默认 100，恢复开度）；
+//  5. 在日志里提示用户等电机转完再断电，避免带电拔线烧驱动。
+//
+// 注意：本用例不读取 M-Bus 的开度反馈——设备回读的不是实时值，机械
+// 到位要靠肉眼确认。流程靠两次人工弹框驱动。
 //
 // 不判断 test_mode==normal——本 Run 场景本身就是 normal（产线 normal
 // 计划下才会执行此用例，对应 Perl 里的 if 分支在 Run 路径恒为真）。
 type WireValveMBusReadMotorCase struct {
-	keyState  string        // 期望状态，默认 "01"（电机启动完成）
-	pollTimes int           // 轮询次数，默认 180
-	pollSleep time.Duration // 轮询间隔，默认 1s
+	step1Open int // 阶段 1 目标开度（%），默认 80
+	step2Open int // 阶段 2 恢复开度（%），默认 100
 }
 
 func (c *WireValveMBusReadMotorCase) Name() string {
 	return "wire_valve_mbus_read_motor"
 }
 
-// Configure 读取 plan 的自定义参数（对应 Perl
-// BLAT::APP::Heat::Cases::wire_valve::dev_normal_check_motor_args 的默认值：
-// 期望状态="01"、轮询次数=180、轮询间隔=1s）。键名中文优先，
-// 同时兼容英文键 key_state；未知键忽略不报错。
+// Configure 读取 plan 的自定义参数。键名中文优先，同时兼容英文键
+// step1_open/step2_open；未知键忽略不报错。
+// 整数读取兼容 YAML 解析出的 int/int64/float64。
 func (c *WireValveMBusReadMotorCase) Configure(args map[string]any) error {
 	// 默认值
-	c.keyState = "01"
-	c.pollTimes = 180
-	c.pollSleep = time.Second
+	c.step1Open = 80
+	c.step2Open = 100
 
-	// 期望状态：中文键优先，兼容英文 key_state
-	if v, ok := args["期望状态"].(string); ok && v != "" {
-		c.keyState = v
-	} else if v, ok := args["key_state"].(string); ok && v != "" {
-		c.keyState = v
+	// 阶段开度：中文键优先，兼容英文；非 [0,100] 视为非法值忽略
+	if v, ok := lookupInt(args, "第一阶段开度", "step1_open"); ok && v >= 0 && v <= 100 {
+		c.step1Open = v
 	}
-
-	if v := _int(args, "轮询次数"); v > 0 {
-		c.pollTimes = v
-	}
-	if v := _int(args, "轮询间隔"); v > 0 {
-		c.pollSleep = time.Duration(v) * time.Second
+	if v, ok := lookupInt(args, "第二阶段开度", "step2_open"); ok && v >= 0 && v <= 100 {
+		c.step2Open = v
 	}
 	return nil
+}
+
+// lookupInt 从 args 中按顺序查 keys（中文→英文），命中第一个存在的键。
+// 返回 (值, 是否命中)；YAML 解析的 int/int64/float64 都接受。无可识别值
+// 返回 (0, false)，调用方据此判断是否覆盖默认值。
+func lookupInt(args map[string]any, keys ...string) (int, bool) {
+	for _, k := range keys {
+		v, ok := args[k]
+		if !ok {
+			continue
+		}
+		switch x := v.(type) {
+		case int:
+			return x, true
+		case int64:
+			return int(x), true
+		case float64:
+			return int(x), true
+		}
+	}
+	return 0, false
 }
 
 func (c *WireValveMBusReadMotorCase) Run(ctx context.Context, env *core.Env) error {
@@ -72,56 +87,27 @@ func (c *WireValveMBusReadMotorCase) Run(ctx context.Context, env *core.Env) err
 		return err
 	}
 
-	// 1. 校准电机（对应 Perl L247 CaliValveByMbus）。mock 模式直接成功；
-	// real 模式发 BB1F SET_VALVE 帧（open_pre=0, calc_day=255）。
-	if err := dev.CaliValveByMbus(ctx, mac); err != nil {
-		return fmt.Errorf("初始化电机失败: %w", err)
+	// 阶段 1：设置开度 step1Open → 弹框让用户确认电机开始转动
+	if err := dev.SetValveOpenpreByMbus(ctx, mac, c.step1Open); err != nil {
+		return fmt.Errorf("设置阶段1开度 %d 失败: %w", c.step1Open, err)
 	}
-
-	// 1.5 弹框让用户观察阀门是否转动（对齐 Perl `ui_show_judgment`）：
-	// 校准命令发出后人工肉眼确认电机已转。选"否"→ 用例直接失败；
-	// 选"是"→ 继续后面的轮询校验。回车 = 「是」（Fyne Confirm 默认
-	// 焦点在「是」按钮上，参见 internal/ui/fyne/app.go yesNoCh 处理）。
-	if err := askValveTurned(ctx, env); err != nil {
+	if err := askValveTurning(ctx, env, c.step1Open); err != nil {
 		return err
 	}
 
-	// 2. 轮询读取电机状态，直到匹配期望值或轮询次数耗尽
-	for i := 0; i < c.pollTimes; i++ {
-		ret, rerr := dev.MBusReadMotor(ctx, mac)
-		retText := "undef"
-		if rerr == nil {
-			retText = ret
-		}
-		env.Log.Info("", fmt.Sprintf("状态值: %s, 期望值：%s", retText, c.keyState))
-		if rerr == nil && ret == c.keyState {
-			// 电机启动完成，做一次"状态保存"校验
-			if err := c.checkStateSaved(ctx, dev, mac, env); err != nil {
-				return err
-			}
-			return nil
-		}
-		if err := _sleep(ctx, c.pollSleep); err != nil {
-			return err
-		}
-	}
-	// 对应 Perl ok 0 "电机未启动完成"
-	return fmt.Errorf("电机未启动完成")
-}
-
-// checkStateSaved 对应 Perl L272-285：sleep 1 后读设备信息（BB1E
-// _MbusReadInfo），校验 alarm==0 表示状态已保存。失败返回 error。
-func (c *WireValveMBusReadMotorCase) checkStateSaved(ctx context.Context, dev *mbus.Device, mac string, env *core.Env) error {
-	if err := _sleep(ctx, time.Second); err != nil {
+	// 阶段 1.5：弹框让用户等电机转完到目标位置后手动点确认，
+	// 再恢复开度到 step2Open。机械到位要靠肉眼，开度回读不实时。
+	if err := askValveDoneWait(ctx, env, c.step1Open, c.step2Open); err != nil {
 		return err
 	}
-	info, err := dev.MbusReadInfo(ctx, mac)
-	if err != nil {
-		return fmt.Errorf("读取设备当前信息失败: %w", err)
+
+	// 阶段 2：恢复开度到 step2Open
+	if err := dev.SetValveOpenpreByMbus(ctx, mac, c.step2Open); err != nil {
+		return fmt.Errorf("恢复阶段2开度 %d 失败: %w", c.step2Open, err)
 	}
-	if info.Alarm != 0 {
-		return fmt.Errorf("状态保存失败: alarm: %d", info.Alarm)
-	}
+
+	// 结束提示：电机仍在转，提醒用户等转完再断电，避免带电拔线烧驱动。
+	env.Log.Warn("", fmt.Sprintf("已恢复开度到 %d%%，请等电机转完再断电", c.step2Open))
 	return nil
 }
 
@@ -131,19 +117,35 @@ func init() {
 	})
 }
 
-// askValveTurned 弹一个「是/否」确认框，让操作员确认电机校准后阀门已转动。
+// askValveTurning 弹一个「是/否」确认框，让操作员确认电机已开始转动。
 // 选「是」→ 返回 nil 继续；选「否」→ 返回 error（用例失败）；
 // ctx 取消（Stop 按钮 / 关窗）→ 返回 ctx.Err()。回车默认「是」（参见
 // internal/ui/fyne/app.go yesNoCh 处理，默认焦点在「是」上）。
-func askValveTurned(ctx context.Context, env *core.Env) error {
-	ok, err := env.UI.Confirm(ctx, "请观察阀门是否已转动（电机校准命令已发出）？选「否」将停止并失败", true)
+// openPre 参数告知用户刚设置的目标开度值，文案携带便于判断。
+func askValveTurning(ctx context.Context, env *core.Env, openPre int) error {
+	msg := fmt.Sprintf("已通过 M-Bus 设置阀门开度到 %d%%，请观察电机是否已开始转动？选「否」将停止并失败", openPre)
+	ok, err := env.UI.Confirm(ctx, msg, true)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return errors.New("用户确认阀门未转动")
+		return errors.New("用户确认电机未转动")
 	}
-	env.Log.Info("", "已确认阀门转动")
+	env.Log.Info("", fmt.Sprintf("已确认电机开始转动（开度 %d%%）", openPre))
+	return nil
+}
+
+// askValveDoneWait 弹一个「确定」按钮的提示框，让用户等电机转到目标位置
+// 完成后手动点确认，确认后用例再继续恢复开度。机械到位要肉眼判断，开度
+// 回读不是实时值。ctx 取消（Stop 按钮 / 关窗）→ 返回 ctx.Err()。
+// fromOpen/toOpen 仅用于文案告知用户当前→目标的开度值。
+func askValveDoneWait(ctx context.Context, env *core.Env, fromOpen, toOpen int) error {
+	msg := fmt.Sprintf("请等待电机转到 %d%% 目标位置后点击「确定」，确认后用例将继续把开度恢复到 %d%%",
+		fromOpen, toOpen)
+	if err := env.UI.Message(ctx, msg, true); err != nil {
+		return err
+	}
+	env.Log.Info("", fmt.Sprintf("用户已确认电机转到 %d%%，准备恢复开度到 %d%%", fromOpen, toOpen))
 	return nil
 }
 

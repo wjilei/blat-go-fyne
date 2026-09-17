@@ -56,8 +56,13 @@ type Device struct {
 	portName   string
 	mockStatus string // mock 电机状态，默认 "01"
 	mockInfo   MbusInfo // mock MbusReadInfo 返回值，默认 Alarm=0
-	logger     Logger
-	debug      bool // true 时 MBusReadMotor 打印发送/接收 hex（--debug 模式）
+	// mockOpenPreSeq + mockOpenPreIdx：MbusReadInfo 每次读消费一个
+	// OpenPre，未配序列时回退到 mockInfo.OpenPre。仅 mock 模式生效，
+	// 用于单测两阶段开度检查 happy path（阶段 1 读 80 → 阶段 2 读 100）。
+	mockOpenPreSeq []uint8
+	mockOpenPreIdx int
+	logger         Logger
+	debug          bool // true 时 MBusReadMotor 打印发送/接收 hex（--debug 模式）
 }
 
 // MbusInfo 是 _MbusReadInfo（Perl UserValve.pm L556-599）一次读全的设备
@@ -116,6 +121,17 @@ func (d *Device) SetMockInfo(info MbusInfo) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.mockInfo = info
+}
+
+// SetMockOpenPreSequence 注入 MbusReadInfo mock 路径的开度序列。每次
+// 读取依次返回序列中的下一个 OpenPre（其它字段沿用 mockInfo）；序列
+// 末尾保持最后一个值。仅 mock 模式生效，real 模式下调用无效果。空
+// 序列或不调用本方法时，MbusReadInfo 直接返回 mockInfo.OpenPre。
+func (d *Device) SetMockOpenPreSequence(pres ...uint8) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.mockOpenPreSeq = append([]uint8(nil), pres...)
+	d.mockOpenPreIdx = 0
 }
 
 // SetLogger 注入日志输出（通常传 env.Log 适配器）。nil 时静默跳过。
@@ -327,6 +343,12 @@ func (d *Device) MbusReadInfo(ctx context.Context, mac string) (MbusInfo, error)
 		}
 		d.mu.Lock()
 		info := d.mockInfo
+		if len(d.mockOpenPreSeq) > 0 {
+			info.OpenPre = d.mockOpenPreSeq[d.mockOpenPreIdx]
+			if d.mockOpenPreIdx < len(d.mockOpenPreSeq)-1 {
+				d.mockOpenPreIdx++
+			}
+		}
 		d.mu.Unlock()
 		return info, nil
 	}
