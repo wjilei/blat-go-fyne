@@ -15,8 +15,10 @@ import (
 //  1. 通过 M-Bus 设置阀门开度到 step1Open（默认 80）；
 //  2. 弹框询问用户确认电机已开始转动；
 //  3. 弹框提示用户等电机转完到目标位置后手动点确认；
-//  4. 再次设置阀门开度到 step2Open（默认 100，恢复开度）；
-//  5. 在日志里提示用户等电机转完再断电，避免带电拔线烧驱动。
+//  4. 读取 M-Bus 设备信息校验告警位（Alarm 必须为 0，非 0 视为电机
+//     状态异常，立即失败不恢复开度）；
+//  5. 再次设置阀门开度到 step2Open（默认 100，恢复开度）；
+//  6. 在日志里提示用户等电机转完再断电，避免带电拔线烧驱动。
 //
 // 注意：本用例不读取 M-Bus 的开度反馈——设备回读的不是实时值，机械
 // 到位要靠肉眼确认。流程靠两次人工弹框驱动。
@@ -101,6 +103,18 @@ func (c *WireValveMBusReadMotorCase) Run(ctx context.Context, env *core.Env) err
 		return err
 	}
 
+	// 阶段 1.6：读取 M-Bus 设备信息，确认告警位为 0 后再恢复开度。
+	// 对齐 Perl dev_normal_check_motor 末尾的 alarm 校验：Alarm 非 0 说明
+	// 电机状态异常（如堵转/过温），不应继续把开度恢复到 step2Open。
+	info, err := dev.MbusReadInfo(ctx, mac)
+	if err != nil {
+		return fmt.Errorf("读取M-Bus设备信息失败: %w", err)
+	}
+	if info.Alarm != 0 {
+		return fmt.Errorf("M-Bus读取到告警(Alarm=%d)，不继续恢复开度", info.Alarm)
+	}
+	env.Log.Info("", fmt.Sprintf("M-Bus 设备信息读取成功，无告警（Alarm=0），准备恢复开度到 %d%%", c.step2Open))
+
 	// 阶段 2：恢复开度到 step2Open
 	if err := dev.SetValveOpenpreByMbus(ctx, mac, c.step2Open); err != nil {
 		return fmt.Errorf("恢复阶段2开度 %d 失败: %w", c.step2Open, err)
@@ -136,9 +150,9 @@ func askValveTurning(ctx context.Context, env *core.Env, openPre int) error {
 }
 
 // askValveDoneWait 弹一个「确定」按钮的提示框，让用户等电机转到目标位置
-// 完成后手动点确认，确认后用例再继续恢复开度。机械到位要肉眼判断，开度
-// 回读不是实时值。ctx 取消（Stop 按钮 / 关窗）→ 返回 ctx.Err()。
-// fromOpen/toOpen 仅用于文案告知用户当前→目标的开度值。
+// 完成后手动点确认，确认后用例再读取 M-Bus 信息校验告警、恢复开度。
+// 机械到位要肉眼判断，开度回读不是实时值。ctx 取消（Stop 按钮 / 关窗）
+// → 返回 ctx.Err()。fromOpen/toOpen 仅用于文案告知用户当前→目标的开度值。
 func askValveDoneWait(ctx context.Context, env *core.Env, fromOpen, toOpen int) error {
 	msg := fmt.Sprintf("请等待电机转到 %d%% 目标位置后点击「确定」，确认后用例将继续把开度恢复到 %d%%",
 		fromOpen, toOpen)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"blat/internal/core"
@@ -197,6 +198,42 @@ func newMBusRunEnv(ui *fakeUI, dev *mbus.Device) *core.Env {
 	}
 }
 
+// recordLog 记录 Info/Warn/Error 消息文本，用于断言关键步骤日志
+// （区别于无输出的 fakeLog）。
+type recordLog struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *recordLog) Info(category, msg string)  { l.add(msg) }
+func (l *recordLog) Warn(category, msg string)  { l.add(msg) }
+func (l *recordLog) Error(category, msg string) { l.add(msg) }
+
+func (l *recordLog) add(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, msg)
+}
+
+func (l *recordLog) contains(sub string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range l.msgs {
+		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// newMBusRunEnvLog 同 newMBusRunEnv，但日志换成指定 logger（便于断言
+// MbusReadInfo 调用日志）。
+func newMBusRunEnvLog(ui *fakeUI, dev *mbus.Device, log core.Logger) *core.Env {
+	env := newMBusRunEnv(ui, dev)
+	env.Log = log
+	return env
+}
+
 // happy path：弹框 1 选是 + 弹框 2 点确定 → Run 成功，且 SetValveOpenpre
 // 被调用两次（80 → 100），日志写入断电提醒。
 func TestWireValveMBusReadMotorCase_Run_HappyPath(t *testing.T) {
@@ -270,5 +307,59 @@ func TestWireValveMBusReadMotorCase_Run_CtxCanceledAtMessage(t *testing.T) {
 	err := c.Run(context.Background(), newMBusRunEnv(ui, dev))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, 期望 errors.Is(..., context.Canceled)", err)
+	}
+}
+
+// 阶段 1.6 alarm 校验（Alarm=0 正常）：MbusReadInfo 返回 Alarm=0 → 流程
+// 正常继续到阶段 2 恢复开度，且日志记录无告警。
+func TestWireValveMBusReadMotorCase_Run_ReadAlarmOK(t *testing.T) {
+	dev := mbus.NewMockDevice()
+	if err := dev.Connect(context.Background(), "COM9"); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	dev.SetMockInfo(mbus.MbusInfo{Alarm: 0})
+	ui := &fakeUI{confirmRet: true}
+	log := &recordLog{}
+	c := &WireValveMBusReadMotorCase{}
+	if err := c.Configure(nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if err := c.Run(context.Background(), newMBusRunEnvLog(ui, dev, log)); err != nil {
+		t.Fatalf("Alarm=0 应继续流程成功, 实际: %v", err)
+	}
+	ui.mu.Lock()
+	if ui.messageN != 1 {
+		t.Errorf("阶段 2 应继续执行, Message(等转完) 调用 %d, 期望 1", ui.messageN)
+	}
+	ui.mu.Unlock()
+	if !log.contains("无告警") {
+		t.Errorf("日志应记录无告警信息, 实际: %v", log.msgs)
+	}
+}
+
+// Alarm 非 0 失败：MbusReadInfo 返回 Alarm=1 → Run 应失败，错误信息包含
+// 告警位实际值，且流程在阶段 2 恢复开度之前中断。
+func TestWireValveMBusReadMotorCase_Run_ReadAlarmNonZero(t *testing.T) {
+	dev := mbus.NewMockDevice()
+	if err := dev.Connect(context.Background(), "COM9"); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	dev.SetMockInfo(mbus.MbusInfo{Alarm: 1})
+	ui := &fakeUI{confirmRet: true}
+	c := &WireValveMBusReadMotorCase{}
+	if err := c.Configure(nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	err := c.Run(context.Background(), newMBusRunEnv(ui, dev))
+	if err == nil {
+		t.Fatal("Alarm 非 0 应使 Run 返回错误")
+	}
+	if !strings.Contains(err.Error(), "告警") || !strings.Contains(err.Error(), "1") {
+		t.Errorf("错误信息 = %q, 期望提到「告警」与实际值 1", err.Error())
+	}
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	if ui.messageN != 1 {
+		t.Errorf("Alarm 校验失败应在阶段 2 前中断, Message 调用 %d, 期望 1（仅等转完确认框）", ui.messageN)
 	}
 }
