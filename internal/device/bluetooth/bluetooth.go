@@ -1423,8 +1423,8 @@ func setConfigOK(raw []byte) bool {
 		return false
 	}
 	up := bytes.ToUpper([]byte(hex.EncodeToString(raw)))
-	return bytes.Contains(up, []byte("05F8BF0000FF")) ||
-		bytes.Contains(up, []byte("05F9BF0000FF"))
+	return bytes.Contains(up, []byte("05F8BF")) ||
+		bytes.Contains(up, []byte("05F9BF"))
 }
 
 // ---- id 到 BLE 地址的派生（对应 Perl BLAT::Common::Utils::parseIdToMac）----
