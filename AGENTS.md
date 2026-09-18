@@ -20,6 +20,7 @@ fyne.Do(func() {
 ```
 
 **注意**：
+
 - 直接 `dlg.Show()` 后立即 `win.Canvas().Focus(entry)` 通常无效——dialog 还没 mount 到 canvas 树。
 - `time.AfterFunc(50*time.Millisecond, ...)` 是兜底方案；若 `fyne.Do` 路径不稳定再换。
 - 多 Entry 弹框：focus 第一个即可，后续用 Tab 切换（Fyne v2.4+ Form 内置 Tab Order）。
@@ -31,6 +32,7 @@ fyne.Do(func() {
 **规则**：写新代码时若遇到老代码结构不合理、阻碍扩展或违背当前需求，**该重构就重构**，遵循软件开发最佳实践（单一职责、清晰命名、最小惊讶、避免重复等），不必为兼容老结构而绕路。
 
 **注意**：
+
 - 重构以"不改变既有行为"为底线；涉及行为变化的改动需向用户说明。
 - 改完后跑 `go build ./...` 与相关测试，确保重构没有破坏现有功能。
 - 重构范围控制在当前任务相关代码内，不顺手大改无关模块。
@@ -40,11 +42,13 @@ fyne.Do(func() {
 **规则**：本项目开发遵循 TDD（测试驱动开发），先写测试、再写实现、最后重构。
 
 **标准流程**：
+
 1. **Red**：先写失败的测试，明确描述期望行为（函数签名、输入、预期输出/错误）。
 2. **Green**：写最简实现让测试通过，不提前优化。
 3. **Refactor**：在测试保护下重构，消除重复、改善命名与结构，测试保持绿色。
 
 **注意**：
+
 - 测试文件与被测代码同包（`foo_test.go` 放 `foo.go` 同目录），包名用 `package xxx` 或 `package xxx_test` 均可，视是否需要访问未导出符号而定。
 - 纯逻辑（配置解析、上报字段组装、URL 构造、状态机等）必须有单元测试；依赖外部资源（网络、OSS、蓝牙、串口、Fyne UI）的逻辑通过接口抽象 + fake/mock 测试，不真实触网。
 - 新增/修改功能时，先看是否已有对应测试；没有就先补测试再写实现。
@@ -58,6 +62,7 @@ fyne.Do(func() {
 **原因**：`_test.go` 后缀是 Go 约定的测试文件命名，Go 工具链只会在 `go test` 时编译它，`go build` / `go run` / 产出的 exe **完全排除**这类文件。用例靠 `init()` 里的 `Register` 注册，文件不进 exe → 运行时报 `case not registered: <Suite>::<Method>`，但 `go test ./cmd/blat/cases/` 却一切正常（测试二进制含该文件），极难定位。
 
 **注意**：
+
 - 纯用例实现文件（含 `init() Register` 与辅助函数）命名为 `xxx.go`（如 `wire_valve_bluetooth.go`），不带 `_test`。
 - 真正的测试文件（`func Test*`）仍必须用 `_test.go` 后缀——两者不要混在一个文件里。
 - 排查 `case not registered` 时先检查文件名，再用 `go run`（非 `go test`）验证注册表。
@@ -104,11 +109,12 @@ blat-go-fyne/
 - **config**：plan 为顶层 YAML 序列，保留字段 `name/title/desc/case_seq/counts/parallel`，其余键平铺进 `Args` 传给 case。`TestModeFromPlanPath` 从文件名解析模式：`confs/plan_PSAV_ut_check_state.yml` → `ut_check_state`。
 - **device/bluetooth**：**故意不实现 core.Device**。挂在 `env.Devs["bluetooth"]`（main 注入 `NewDevice()` = real）。mock/real 由 `NewMockDevice`/`NewRealDevice` 构造；`bt_mock` 标志决定 case 端选哪个。协议帧头字节：PSAV→`f9`、其它→`f8`；GATT 服务 `0xfff0`、特征 `0xfff2`。**mac 由序列号经 `ParseIdToMac(id)` 派生（新格式 FC:XX:XX:XX:XX:XX，对齐 Perl 7b1f4349；`ParseIdToMacOld` 旧格式 FC:E8:92:XX:XX:XX 保留用于 ≤58 固件兼容）**。真实 BLE 的大多数 tinygo 调用投递到专用串行 executor goroutine 依次执行（规避 Windows 上非主线程并发调用崩溃，tinygo issue #294）；**GATT 服务/特征发现额外走全局门闸 + 超时 + 重试机制**（16s 总预算、3/8 次重试、250ms×attempt 退避），超时则把进程标记为 hung 并让所有 BLE 入口快速失败（Windows 上 WinRT 卡死在进程内无法复位）。常用方法：`Connect/Disconnect/Reboot/Read/ResetValve/EnableNbiot/DisableNbiot/SetDevType/SetLogger/SetMockStatus/SetDebug/IsConnected`。mock 默认数据保证 PSAV 流程首读通过（NbRssi≥−81 → NB ok、ValveState=0）。
 - **ui/fyne**：UI 变更一律 `fyne.Do` 上主线程；`Prompt`/`WaitContinue` 通过 `promptReq`/`confirmReq` 异步通道弹框实现。**用户运行时产物都落在 `%USERPROFILE%\.blat\`**（与 `uploader.uuid.txt` 同目录，规避安装目录只读）：
-  - `env.yml` — 配置（MBUS 端口等），`SaveEnv` 落盘时只写 `HeatNote.mbus.{baudRate,parity,port}` 三个字段——其余运行时字段（`TEST_WORKSTATION` / `HeatNote.bt_mock` / `HeatNote.plan` / `HeatNote.bluetooth` 等）不混入用户配置。
+  - `env.yml` — 配置（MBUS 端口与可选升级固件路径），`SaveEnv` 落盘时只写 `HeatNote.mbus.{baudRate,parity,port,firmware?}`——其余运行时字段（`TEST_WORKSTATION` / `HeatNote.bt_mock` / `HeatNote.plan` / `HeatNote.bluetooth` 等）不混入用户配置。
   - `test.log` — 测试日志（每次点击"开始测试"由 `startRun` 截断，上报时全量读取）。
   - `report.yml` — YAML 测试报告（GUI 模式固定文件名；Console 模式生成 `report_<ts>.yml`）。
 
   **dev / release 切换**：release（NSIS 安装到 `%ProgramFiles%`）→ 三个文件都落到 `~/.blat/`；dev（`go run` / `go build` 直接运行）→ `test.log` / `report.yml` 落到 cwd，便于 `ls` 找产物（`env.yml` 永远走 `~/.blat/`，与发布模式一致）。强制覆盖：env `BLAT_DEV_FILES=1` 切 dev，`=release` 切 release，自动检测看 `os.Executable()` 是否在 `%ProgramFiles%` 子树下（详见 `config.isInstalledExe`）。
+
 - **uploader**：`HookStopReporter` 实现 `report.Reporter`，`OnPlanStop` 时把 Console/GUI 环形缓冲的完整日志 LZMA 压缩上传 OSS，并把测试记录 POST 到 BLAT 后台（对齐 Perl `hook_stop`）；`--debug` 时不触网仅打印。`GetTestRecord` 查询整机测试记录（devType=2）。
 - **serial**：`ListPorts()` 读注册表 `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM`，按 COM 数字排序去重。刻意不用第三方串口库，保持 cgo-free。
 
@@ -123,11 +129,10 @@ go run ./cmd/blat --debug                          # 上报只打印不触网
 
 ### 关键约定
 
-- **HeatNote**：`env.yml` 顶层 key，case 运行期的状态中枢。**持久化字段**（`mbus`）落盘到 `~/.blat/env.yml`；**运行时字段**（`serial / lot / model / pn / tenant_id / user / bt_mock / plan / bluetooth` 等）只在内存，不写盘——`applyMBUSPort` 写盘时构造的 vars 只含 `HeatNote.mbus`，不混入其他子键。键名大写。
+- **HeatNote**：`env.yml` 顶层 key，case 运行期的状态中枢。**持久化字段**（`mbus`，含串口参数与可选 `firmware` 路径）落盘到 `~/.blat/env.yml`；**运行时字段**（`serial / lot / model / pn / tenant_id / user / bt_mock / plan / bluetooth` 等）只在内存，不写盘——`applyConfig` 写盘时构造的 vars 只含 `HeatNote.mbus`，不混入其他子键。键名大写。
 - **蓝牙连接复用**：所有蓝牙用例统一走 `_ensureBluetooth`（cases 包）：优先取 `HeatNote["bluetooth"]`；否则仅当 `Devs["bluetooth"]` 实例模式与 `bt_mock` 一致才兜底复用，再否则按 `bt_mock` 新建 mock/real 并写回。**不要**无条件 fallback 到 `env.Devs["bluetooth"]`——main 默认注入 real，会让 `-mock-bt=true` 拿不到 mock。
 - **新加用例**：在 `cmd/blat/cases/` 下新建文件，实现 `core.Case`（可加 `Configure`），`init()` 里 `Register("<Suite>::<方法名>", ...)`，然后在 plan YAML 里按名字引用。
 - **新加计划**：plan 文件放 `confs/`，按 `plan_<设备类型>_<模式>.yml` 命名；GUI 下拉框选项在 `main.go` 的 `builtinPlans` 里追加。
-
 
 ## WSL 路径
 

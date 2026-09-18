@@ -37,6 +37,17 @@ import (
 // errNotConnected 是设备未连接（Connect 未调用或失败）时返回的错误。
 var errNotConnected = errors.New("mbus 设备未连接")
 
+// errMBusWrite 表示请求帧写入串口失败（与"无响应超时"区分）。供
+// UpgradeByMbus 的 dummy 唤醒帧判定：真实 Write 错误必须报错，而设备无
+// 响应（超时）按 Perl 语义可以继续。
+var errMBusWrite = errors.New("mbus: 写入失败")
+
+// errMBusShortWrite 表示 Write 返回 n < len(frame) 且 err==nil（短写）：
+// 串口只接收了半帧。同一 transaction 直接重试会把残帧追加到下一帧上，
+// 必须立即返回不可重试错误（oracle 复审）。普通明确 Write error 仍走
+// errMBusWrite 的 retry 语义。
+var errMBusShortWrite = errors.New("mbus: 短写 (short write)")
+
 // Logger 是 mbus 包可选的日志输出接口。契约要求 Info(args ...any)
 // （调用侧 cmd/blat/cases 的 mbusLogAdapter 按此签名适配 core.Logger）。
 // nil 时静默跳过日志。
@@ -54,15 +65,32 @@ type Device struct {
 	connected  bool // mock 模式的连接标志（real 模式以 port != nil 为准）
 	port       serial.Port
 	portName   string
-	mockStatus string // mock 电机状态，默认 "01"
+	mockStatus string   // mock 电机状态，默认 "01"
 	mockInfo   MbusInfo // mock MbusReadInfo 返回值，默认 Alarm=0
 	// mockOpenPreSeq + mockOpenPreIdx：MbusReadInfo 每次读消费一个
 	// OpenPre，未配序列时回退到 mockInfo.OpenPre。仅 mock 模式生效，
 	// 用于单测两阶段开度检查 happy path（阶段 1 读 80 → 阶段 2 读 100）。
 	mockOpenPreSeq []uint8
 	mockOpenPreIdx int
-	logger         Logger
-	debug          bool // true 时 MBusReadMotor 打印发送/接收 hex（--debug 模式）
+	// mockUpgradeBlocks + mockUpgradeErr：UpgradeByMbus mock 路径的升级块
+	// 记录与注入错误（对应 bluetooth 包 mock 模式的双状态设计）。
+	mockUpgradeBlocks []UpgradeBlock
+	mockUpgradeErr    error
+	logger            Logger
+	debug             bool // true 时 MBusReadMotor 打印发送/接收 hex（--debug 模式）
+}
+
+// UpgradeBlock is one MBus firmware-upgrade data block（对应 Perl
+// UpgradeByMbus L680-692 的 %args + $mbus_dat）。Data 为原始字节
+// （Perl 侧为 hex 字符串，Go 侧在调用前已解码）；BlockID/BlockSize 为
+// 十进制序号/字节数，IsEnd 标记最后一块。
+type UpgradeBlock struct {
+	HardVer   uint8
+	SoftVer   uint8
+	BlockID   int
+	BlockSize int
+	IsEnd     bool
+	Data      []byte
 }
 
 // MbusInfo 是 _MbusReadInfo（Perl UserValve.pm L556-599）一次读全的设备
@@ -132,6 +160,27 @@ func (d *Device) SetMockOpenPreSequence(pres ...uint8) {
 	defer d.mu.Unlock()
 	d.mockOpenPreSeq = append([]uint8(nil), pres...)
 	d.mockOpenPreIdx = 0
+}
+
+// SetMockUpgradeError 注入 UpgradeByMbus mock 路径的返回错误；传 nil 清除。
+// 非 nil 时 mock 升级调用记录 block 后返回该错误（模拟固件写入失败）。
+func (d *Device) SetMockUpgradeError(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.mockUpgradeErr = err
+}
+
+// MockUpgradeBlocks 返回 mock 模式下 UpgradeByMbus 记录的全部升级块
+// （深拷贝，调用方可安全持有）。未调用过返回 nil。
+func (d *Device) MockUpgradeBlocks() []UpgradeBlock {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]UpgradeBlock, len(d.mockUpgradeBlocks))
+	for i, b := range d.mockUpgradeBlocks {
+		out[i] = b
+		out[i].Data = append([]byte(nil), b.Data...)
+	}
+	return out
 }
 
 // SetLogger 注入日志输出（通常传 env.Log 适配器）。nil 时静默跳过。
@@ -327,7 +376,7 @@ func (d *Device) setValveByMbus(ctx context.Context, mac string, openPre, calcDa
 //
 // mock 模式直接返回 mockInfo（默认 Alarm=0，让用例末尾校验通过）；
 // real 模式构造 19 字节请求帧 → commandTrans → 校验 39 字节响应格式
-//（`^\w{34}(\w{8})(\w{8})(\w{2})(\w{2})(\w{2})(\w{2})(\w{8})(\w{8})\w{2}16$`，
+// （`^\w{34}(\w{8})(\w{8})(\w{2})(\w{2})(\w{2})(\w{2})(\w{8})(\w{8})\w{2}16$`，
 // 对应 Perl _MbusReadInfo L569）。
 func (d *Device) MbusReadInfo(ctx context.Context, mac string) (MbusInfo, error) {
 	var zero MbusInfo
@@ -371,6 +420,104 @@ func (d *Device) MbusReadInfo(ctx context.Context, mac string) (MbusInfo, error)
 	}
 	d.logInfo(fmt.Sprintf("MbusReadInfo: %+v", info))
 	return info, nil
+}
+
+// UpgradeByMbus 通过 M-Bus 发送固件升级数据块（cmd_id=BB20），对应 Perl
+// UserValve.pm UpgradeByMbus L680-717 + dev_mbus_fill_set_cmd BB20 分支
+// L278-300。设备写 flash 完成后才响应（实测 4.4~7.5s 且不稳定），因此
+// 升级帧 commandTrans 用 timeout=2s, retry=5（Perl L699）。
+//
+// mock 模式：未连接返回 errNotConnected；ctx 取消短路；把 blk 记录到
+// mockUpgradeBlocks；若注入过 mockUpgradeErr 则返回之，否则返回 nil。
+// real 模式：先发 address dummy 唤醒帧（Perl L695-696，
+// command_trans timeout=>0.05 retry=>1，结果丢弃；但 ctx 取消必须透传，
+// 真实 Write 错误必须报错），再构造 155 字节 BB20 升级帧发送。响应兼容
+// 新旧格式：命中新固件格式 `^\w{34}(\w{2})(\w{4})\w{2}16$` 时解析
+// dev_ret / next_block_id 并校验（devRet!=0 或 nextBlockID!=BlockID+1
+// 视为设备拒绝，返回错误；Perl 原版只打日志不检查，oracle 审查强化）；
+// 旧格式（不匹配正则）保持"不校验应答"，只打成功行。
+func (d *Device) UpgradeByMbus(ctx context.Context, mac string, blk UpgradeBlock) error {
+	// 参数校验先行（BlockID/Data/BlockSize），非法直接返回，不发任何字节
+	if err := validateUpgradeBlock(blk); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	mock := d.mock
+	connected := d.connected
+	port := d.port
+	d.mu.Unlock()
+
+	if mock {
+		if !connected {
+			return errNotConnected
+		}
+		if err := ctxErr(ctx); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		d.mockUpgradeBlocks = append(d.mockUpgradeBlocks, blk)
+		e := d.mockUpgradeErr
+		d.mu.Unlock()
+		return e
+	}
+	if port == nil {
+		return errNotConnected
+	}
+
+	// address dummy 唤醒帧（dev_mubs_addr_cmd_dummy，UserValve.pm L200-217）：
+	// Perl 语义是结果丢弃、设备无响应可继续（command_trans timeout=>0.05
+	// retry=>1）；但真实 Write 错误（全轮次失败 errMBusWrite）与短写
+	//（errMBusShortWrite，半帧）必须可观测并失败（oracle 复审：不能把串口
+	// 故障当"无响应"吞掉），ctx 取消也必须透传。
+	_, dummyErr := d.commandTrans(ctx, port, buildUpgradeDummyFrame(), 50*time.Millisecond, 1)
+	if errors.Is(dummyErr, errMBusWrite) || errors.Is(dummyErr, errMBusShortWrite) {
+		return fmt.Errorf("升级唤醒帧发送失败: %w", dummyErr)
+	}
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+
+	frame, err := buildUpgradeFrame(mac, blk)
+	if err != nil {
+		return err
+	}
+	// Perl L699: timeout=>2, retry=>5
+	ret, err := d.commandTrans(ctx, port, frame, 1*time.Second, 5)
+	if err != nil {
+		return err
+	}
+	// 新固件响应：data = [ret(1B) | next_block_id(2B LE)]，长度 0x06。
+	// devRet 非 0（设备拒绝）或 nextBlockID != BlockID+1 视为发送失败；
+	// 旧固件响应不含 ret 字段，格式不匹配不打解析日志，只打成功行
+	//（Perl "不校验应答"，非匹配不视为错误，L705-716）。
+	if devRet, nextBlockID, ok := parseUpgradeResponse(ret); ok {
+		if devRet != 0 {
+			return fmt.Errorf("升级块 %d 设备返回错误 ret=0x%02x", blk.BlockID, devRet)
+		}
+		if int(nextBlockID) != blk.BlockID+1 {
+			return fmt.Errorf("升级块 %d 设备返回 next_block_id=%d 不符合预期 (%d)", blk.BlockID, nextBlockID, blk.BlockID+1)
+		}
+		d.logInfo(fmt.Sprintf("升级块 %d 设备返回 ret=0x%02x next_block_id=%d", blk.BlockID, devRet, nextBlockID))
+	} else {
+		d.logInfo(fmt.Sprintf("升级块 %d 发送成功", blk.BlockID))
+	}
+	return nil
+}
+
+// validateUpgradeBlock 校验升级块参数（oracle 审查强化）：BlockID 必须
+// 0..65535、Data 长度必须 1..128、BlockSize 必须 == len(Data) 且 1..128。
+// 非法返回 error，不静默截断。
+func validateUpgradeBlock(blk UpgradeBlock) error {
+	if blk.BlockID < 0 || blk.BlockID > 0xFFFF {
+		return fmt.Errorf("mbus: 升级块 BlockID=%d 超出范围 0..65535", blk.BlockID)
+	}
+	if len(blk.Data) < 1 || len(blk.Data) > 128 {
+		return fmt.Errorf("mbus: 升级块数据长度 %d 超出范围 1..128", len(blk.Data))
+	}
+	if blk.BlockSize < 1 || blk.BlockSize > 128 || blk.BlockSize != len(blk.Data) {
+		return fmt.Errorf("mbus: BlockSize=%d 必须等于数据长度 %d 且在 1..128 内", blk.BlockSize, len(blk.Data))
+	}
+	return nil
 }
 
 // ---- 请求帧构造（对应 Perl BLAT UserValve.pm dev_mbus_fill_set_cmd）----
@@ -544,6 +691,27 @@ func parseInfoResponse(ret string) (MbusInfo, error) {
 	}, nil
 }
 
+// parseUpgradeResponse 解析升级响应帧（新固件格式），对应 Perl UpgradeByMbus
+// L707-712：`^\w{34}(\w{2})(\w{4})\w{2}16$`。返回设备返回值 devRet 与期望的
+// 下一块序号 nextBlockID（little-endian uint16）。格式不匹配返回 ok=false
+// （Perl "不校验应答"，非匹配只影响日志，不视为错误）。
+func parseUpgradeResponse(ret string) (devRet uint8, nextBlockID uint16, ok bool) {
+	re := regexp.MustCompile(`^\w{34}(\w{2})(\w{4})\w{2}16$`)
+	m := re.FindStringSubmatch(ret)
+	if m == nil {
+		return 0, 0, false
+	}
+	v, err := strconv.ParseUint(m[1], 16, 8)
+	if err != nil {
+		return 0, 0, false
+	}
+	b, err := hex.DecodeString(m[2])
+	if err != nil {
+		return 0, 0, false
+	}
+	return uint8(v), binary.LittleEndian.Uint16(b), true
+}
+
 // ---- 请求帧构造（SET_VALVE BB1F，对应 Perl UserValve.pm L156-160
 // SET_VALVE 模板 + L273-277 数据填充）----
 
@@ -623,6 +791,80 @@ func buildReadInfoFrame(mac string) ([]byte, error) {
 	return frame, nil
 }
 
+// buildUpgradeDummyFrame 构造升级前的"地址唤醒"帧，对应 Perl UserValve.pm
+// dev_mubs_addr_cmd_dummy L200-217。字节为 Perl 字面量原样（checksum 0xc0
+// 按字面量发送，不重算）。
+func buildUpgradeDummyFrame() []byte {
+	return []byte{
+		0xfe, 0xfe, 0xfe, 0x68, 0x20,
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // 5-11 地址（哑地址）
+		0x03, 0x03, // 12-13 C / data_len
+		0x81, 0x0a, // 14-15 cmd_id
+		0x01, // 16 sub_id
+		0xc0, // 17 CS（Perl 字面量，不重算）
+		0x16, // 18 结束符
+	}
+}
+
+// buildUpgradeFrame 构造 UPGRADE_REQ（BB20）升级请求帧，155 字节。对应
+// Perl UserValve.pm dev_get_mbus_data("UPGRADE_REQ") L162-175 模板 +
+// dev_mbus_fill_set_cmd BB20 分支 L278-300：
+//
+//	索引: 0-2 前导 FE FE FE | 3: 68 | 4: 0x20
+//	| 5-11: 设备ID（12 位 mac 填 5..10、[11] 保持 0；14 位填 5..11）
+//	| 12: 01(C) | 13: 8B(data_len=139=155-16)
+//	| 14-15: cmd_id BB 20 | 16: 01(sub_id)
+//	| 17-18: dev_type LE（未使用，0）
+//	| 19: hard_ver | 20: soft_ver | 21-22: block_id LE
+//	| 23: block_size | 24: is_end（1 或 0）
+//	| 25-152: payload，长度 == len(blk.Data)（1..128），剩余补 0
+//	| 153: CS = sum(3..152) & 0xff（cmd_len = data_len+14 = 153）| 154: 16
+//
+// 数据区从 [17] 开始，布局对齐 slave 端 mbus_slave_handler_upgrade：
+// data[0..1] dev_type(LE) data[2] hard_ver data[3] soft_ver
+// data[4..5] block_id(LE) data[6] block_size data[7] is_end data[8..] payload。
+// 先做参数校验（validateUpgradeBlock）：非法（Data 超 128 / BlockSize 不匹配
+// / BlockID 超范围等）返回 error，不静默截断（oracle 审查强化）。
+func buildUpgradeFrame(mac string, blk UpgradeBlock) ([]byte, error) {
+	if err := validateUpgradeBlock(blk); err != nil {
+		return nil, err
+	}
+	frame := make([]byte, 155)
+	frame[0], frame[1], frame[2], frame[3] = 0xfe, 0xfe, 0xfe, 0x68
+	frame[4] = 0x20
+	frame[12] = 0x01
+	frame[13] = 0x8b // data_len = 155 - 16（dev_mbus_fill_set_cmd L305-307）
+	frame[14], frame[15] = 0xbb, 0x20
+	frame[16] = 0x01
+	// 17-18 dev_type LE 未使用，保持 0
+	frame[19] = blk.HardVer
+	frame[20] = blk.SoftVer
+	frame[21] = byte(blk.BlockID & 0xFF)
+	frame[22] = byte((blk.BlockID >> 8) & 0xFF)
+	frame[23] = byte(blk.BlockSize)
+	if blk.IsEnd {
+		frame[24] = 1
+	}
+	// payload [25..152]：Data 长度已校验 1..128，剩余保持模板 0x00
+	copy(frame[25:25+len(blk.Data)], blk.Data)
+
+	id, err := parseMbusID(mac)
+	if err != nil {
+		return nil, err
+	}
+	for i, v := range id {
+		frame[5+i] = v
+	}
+	// CS = sum(3..152)（Perl L316-322：cmd_len = data_len+14 = 153）
+	var cs byte
+	for i := 3; i <= 152; i++ {
+		cs += frame[i]
+	}
+	frame[153] = cs
+	frame[154] = 0x16
+	return frame, nil
+}
+
 // ---- commandTrans（对应 Perl BLAT serial.pm command_trans L502-552 的
 // mbus 分支 + L688-709 收发循环）----
 
@@ -645,13 +887,27 @@ func (d *Device) commandTrans(ctx context.Context, port serial.Port, frame []byt
 	}
 	matcher := makeMBusMatcher(m[1])
 
+	// writeFailures 统计全部 retry 轮次里 Write 明确失败（err != nil）的
+	// 次数：若所有轮次都写失败，返回 errMBusWrite（区别于超时），供
+	// UpgradeByMbus 判定 dummy 唤醒帧的真实写错误；至少一次 Write 成功但
+	// 无匹配响应仍按超时处理，不影响其它命令的既有行为。
+	writeFailures := 0
 	for i := 0; i < retry; i++ {
 		if err := ctxErr(ctx); err != nil {
 			return "", err
 		}
-		if _, err := port.Write(frame); err != nil {
+		n, err := port.Write(frame)
+		if err != nil {
+			writeFailures++
 			d.logInfo(fmt.Sprintf("mbus 发送失败: %v", err))
-			continue // 进入下一轮 retry
+			continue // 明确写错误：进入下一轮 retry
+		}
+		// 短写（err==nil 但 n < len(frame)）：串口只收半帧，同一 transaction
+		// 直接重试会把残帧追加到下一帧上，必须立即返回不可重试错误
+		//（oracle 复审）。
+		if n < len(frame) {
+			d.logInfo(fmt.Sprintf("mbus 短写 %d/%d 字节", n, len(frame)))
+			return "", errMBusShortWrite
 		}
 		deadline := time.Now().Add(timeout)
 		var recvHex string
@@ -681,6 +937,9 @@ func (d *Device) commandTrans(ctx context.Context, port serial.Port, frame []byt
 				}
 			}
 		}
+	}
+	if writeFailures == retry && retry > 0 {
+		return "", errMBusWrite
 	}
 	return "", fmt.Errorf("mbus: 等待响应超时（重试 %d 次）", retry)
 }

@@ -59,3 +59,24 @@ func TestLogger_InterfaceExpansion(t *testing.T) {
 		t.Errorf("记录条数 = %d/%d, want 4/4", len(rec.lasts), len(rec.msgs))
 	}
 }
+
+// TestEnv_FirmwareSnapshot 锁定固件快照契约：Env.Firmware 字段可挂载
+// FirmwareSnapshot（Path/Data/Size/SHA256），默认 nil（走磁盘路径）。
+func TestEnv_FirmwareSnapshot(t *testing.T) {
+	env := &Env{}
+	if env.Firmware != nil {
+		t.Fatalf("默认 Env.Firmware 应为 nil, 实际 %+v", env.Firmware)
+	}
+	env.Firmware = &FirmwareSnapshot{
+		Path:   `C:\fw\homeValve_PSAV_V2_20260807_v5_ota.bin`,
+		Data:   []byte("ABC"),
+		Size:   3,
+		SHA256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+	}
+	if env.Firmware == nil {
+		t.Fatal("Env.Firmware 赋值后不应为 nil")
+	}
+	if env.Firmware.Path == "" || env.Firmware.Size != int64(len(env.Firmware.Data)) || env.Firmware.SHA256 == "" {
+		t.Fatalf("FirmwareSnapshot 字段不完整: %+v", env.Firmware)
+	}
+}

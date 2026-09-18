@@ -65,6 +65,22 @@ type Env struct {
 	// type-asserted by the Case that owns them.
 	Devs map[string]any
 	Out  io.Writer
+	// Firmware 是一次测试运行期间共享的固件快照（见 FirmwareSnapshot）。
+	// nil 表示未提供快照，case 走磁盘路径。约定：快照创建后只读，不进入
+	// Vars/YAML（由注入方在启动装配时设置，GUI 面板读取固件文件后冻结）。
+	Firmware *FirmwareSnapshot
+}
+
+// FirmwareSnapshot 是一次测试运行期间冻结的固件文件快照（创建后只读）。
+// 用于升级类 Case：若快照路径与 Case 所选固件路径匹配（Windows 语义：
+// filepath.Clean + EqualFold），Case 必须使用快照 Data，不再读磁盘，避免
+// 升级过程中磁盘文件被替换/删除导致刷错固件。Size 必须 == len(Data)，
+// SHA256 必须与 Data 实算值一致（防快照本身损坏）。
+type FirmwareSnapshot struct {
+	Path   string // 快照来源的固件文件路径（供 Case 与所选路径匹配）
+	Data   []byte // 冻结的固件内容
+	Size   int64  // 冻结时的文件大小（字节），必须 == int64(len(Data))
+	SHA256 string // 冻结内容的 SHA-256（hex，小写）
 }
 
 // Device is re-declared here to avoid an import cycle. It is implemented in

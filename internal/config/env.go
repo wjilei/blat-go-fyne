@@ -12,6 +12,7 @@ import (
 // envFileName / testLogFileName / reportFileName 是用户运行时产物的文件名，
 // 都位于 ~/.blat/ 下（与 uploader.uuidFileName 同目录）。这些文件：
 //   - env.yml：用户持久化配置（仅 HeatNote.mbus，避免写 $INSTDIR\confs\ 无写权限）
+//     包含串口参数与可选 firmware 路径。
 //   - test.log：测试运行日志（每次 startRun 由 GUI 截断，上报时全量读取）
 //   - report.yml：测试报告（GUI 模式固定文件名，Console 模式带时间戳）
 // 安装包不应该包含它们——全部由程序运行时落到用户家目录。
@@ -151,7 +152,7 @@ func CleanVars(vars map[string]any, skip ...string) map[string]any {
 // SaveEnv writes vars back to a YAML file at path, overwriting any
 // previous contents. It is the write counterpart of LoadEnv and is
 // used by the GUI to persist user-edited configuration (e.g. the
-// selected MBUS port) to confs/env.yml. The parent directory is created
+// selected MBUS port and firmware path) to env.yml. The parent directory is created
 // automatically if it does not exist yet.
 //
 // The YAML is emitted via yaml.Marshal, which sorts map keys

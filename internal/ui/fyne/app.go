@@ -65,6 +65,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -246,6 +247,27 @@ type App struct {
 	// 禁止把 M-Bus 设备写回缓存（应改为直接 Disconnect）。由 stopAllStations
 	// 置位，受 mu 保护。
 	stationsClosing bool
+	// stationWG 记账所有 bootStation goroutine（含占位放弃路径）。关窗收尾
+	// 时 stopAllStations → finishStationShutdown 等它归零后再统一清设备缓存，
+	// 保证运行中设备由各自 bootStation 收尾断开、不在活跃事务期间提前
+	// Disconnect。Add 在 startStation 的 a.mu 内完成（与 stationsClosing
+	// 检查同一临界区，Wait 只会在 closing 之后发起，无 Add/Wait 竞争）。
+	stationWG sync.WaitGroup
+	// stationShutdownDone 是工位关窗收尾完成的信号：finishStationShutdown
+	// 在等完 stationWG、清完设备缓存后经 stationShutdownOnce 关闭一次。
+	// WaitStationShutdown 等待它返回（重复调用安全）。
+	stationShutdownDone chan struct{}
+	stationShutdownOnce sync.Once
+	// fwSnap 是面板模式的固件内容快照缓存（仅当当前 plan 含
+	// HeatSuite::wire_valve_mbus_upgrade_firmware 时生成）：第一个工位
+	// startStation 在 a.mu 内读盘一次并计算 SHA-256，后续工位/后续轮次复用
+	// 同一份 Data/SHA256（外部替换文件不影响）。fwSnapPlan/fwSnapPath 记录
+	// 生成快照时的 plan 与路径，用于判断复用或重建。配置变更（applyConfig）、
+	// 成功换 plan（loadPlanByPath）、清 plan（clearPlan）、关窗
+	// （stopAllStations）时清空。三者均受 mu 保护。
+	fwSnap     *core.FirmwareSnapshot
+	fwSnapPlan *config.Plan
+	fwSnapPath string
 	// suppressPlanSel 是计划下拉框回退 guard：switchMode 拒绝后
 	// SetSelected(old) 触发的 onPlanSelected 回调直接吞掉，避免递归加载
 	// 旧计划（连带 stopIfRunning 强停当前 run）。受 mu 保护。
@@ -329,6 +351,8 @@ func New(title string) *App {
 		yesNoCh:    make(chan yesNoReq, 8),
 		messageCh:  make(chan messageReq, 8),
 		shutdown:   make(chan struct{}),
+		// 工位关窗收尾完成信号（finishStationShutdown 关闭一次）。
+		stationShutdownDone: make(chan struct{}),
 	}
 	a.build()
 	win.SetOnClosed(func() {
@@ -794,7 +818,7 @@ func (a *App) SetDebug(debug bool) {
 }
 
 // SetVarsFile 设置用户配置（MBUS 串口等）落盘路径。供 main 在启动时调用；
-// 不传则保持 New 时的初始值（空串，applyMBUSPort 拒绝写入并提示）。
+// 不传则保持 New 时的初始值（空串，applyConfig 拒绝写入并提示）。
 // 默认 ~/.blat/env.yml（config.DefaultEnvPath），由 main 从 --env 取值注入。
 func (a *App) SetVarsFile(path string) {
 	a.mu.Lock()
@@ -878,6 +902,13 @@ func (a *App) onPlanSelected(name string) {
 	if suppress {
 		return
 	}
+	// 面板工位运行中拒绝任何 plan 切换（含 panel→panel 换计划、清空计划）：
+	// 不覆盖 a.plan，下拉框回退到当前生效值。
+	if a.stationsBusy() {
+		a.Warn("", "工位正在运行，无法切换计划")
+		a.revertPlanSelect()
+		return
+	}
 	if name == "" || name == planPlaceholder {
 		a.clearPlan()
 		return
@@ -887,17 +918,21 @@ func (a *App) onPlanSelected(name string) {
 		a.Warn("", "未知计划: "+name)
 		return
 	}
-	// 记录当前生效 plan 的显示名，供模式切换被拒绝时回退下拉框
-	// （回调触发时 planSel.Selected 已是新值，旧值只能从 a.plan 反推）。
-	old := a.currentPlanName()
+	// 记录当前生效 plan 的显示名已由 revertPlanSelect 内部反推，这里直接尝试加载。
 	if !a.loadPlanByPath(path) {
 		// 模式切换被拒绝：回退下拉框到旧值（guard 防止回调递归）。
-		a.mu.Lock()
-		a.suppressPlanSel = true
-		a.mu.Unlock()
-		a.planSel.SetSelected(old)
+		a.revertPlanSelect()
 		return
 	}
+}
+
+// revertPlanSelect 把计划下拉框回退到当前生效值并抑制回调递归。
+func (a *App) revertPlanSelect() {
+	old := a.currentPlanName()
+	a.mu.Lock()
+	a.suppressPlanSel = true
+	a.mu.Unlock()
+	a.planSel.SetSelected(old)
 }
 
 // currentPlanName 返回当前生效 plan 在下拉框中的显示名；未加载 plan 时
@@ -954,6 +989,8 @@ func (a *App) loadPlanByPath(path string) bool {
 	a.mu.Lock()
 	a.plan = plan
 	a.rows = a.rows[:0]
+	// 换 plan 成功：清空固件快照缓存（plan 身份变了，不能误用旧快照）。
+	a.clearFirmwareSnapshot()
 	a.mu.Unlock()
 	a.tree.Refresh()
 	for _, c := range plan.Cases {
@@ -974,11 +1011,19 @@ func (a *App) loadPlanByPath(path string) bool {
 
 // clearPlan 清空当前 plan 与用例树（下拉框停在"请选择测试计划"）。
 func (a *App) clearPlan() {
+	// 面板工位运行中拒绝清空计划（防御：onPlanSelected 已拦截，此处兜底）。
+	if a.stationsBusy() {
+		a.Warn("", "工位正在运行，无法清除计划")
+		a.revertPlanSelect()
+		return
+	}
 	a.stopIfRunning()
 	a.ResetTiming()
 	a.mu.Lock()
 	a.plan = nil
 	a.rows = a.rows[:0]
+	// 清 plan：固件快照随之作废（无升级 plan 可依赖）。
+	a.clearFirmwareSnapshot()
 	a.mu.Unlock()
 	a.tree.Refresh()
 	a.setPlanVar("")
@@ -1186,39 +1231,36 @@ func (a *App) queryRecordThenRun(serial string) {
 	})
 }
 
-// promptConfig 弹出配置表单：当前只有一项——MBUS 串口下拉框。
+// promptConfig 弹出配置表单：MBUS 串口下拉框 + 可选升级文件（.bin）。
 //
 // 数据流：
-//  1. 列串口（serial.ListPorts）。列表为空时弹一个"无可用串口"的提示对话框。
-//  2. 从 env.Vars["HeatNote"]["mbus"] 读已保存的端口作为 Select 初值。
-//  3. dialog.NewForm 提交时把新端口写回 env.Vars["HeatNote"]["mbus"]["port"]，
-//     再用 config.SaveEnv 覆盖 confs/env.yml。
+//  1. 列串口（serial.ListPorts）。枚举失败或没有可用串口时不再中断弹框——
+//     端口下拉保持空（占位"选择串口"），升级文件仍然可选；串口为空只在
+//     保存时被拦截（见下）。
+//  2. 从 env.Vars["HeatNote"]["mbus"] 读已保存的端口与升级文件路径作初值。
+//  3. 升级文件行的"选择..."按钮打开 .bin 过滤的文件选择框；取消或出错不
+//     改动当前值。
+//  4. dialog.NewForm 提交时把新端口与升级文件写回
+//     env.Vars["HeatNote"]["mbus"]，再用 config.SaveEnv 覆盖 env.yml。
 //
-// 失败一律弹 dialog.ShowError，不静默吞。
+// 保存规则：串口必选（为空弹"未选择串口"警告、不保存）；升级文件可选，
+// 为空表示不配置。本函数与所有控件回调都在 Fyne 主线程执行。
 func (a *App) promptConfig() {
+	// 任一工位含占位 boot 或正在运行时拒绝打开配置框：避免三工位拿到不同
+	// 全局 firmware（运行中的工位已按旧值启动）。applyConfig 另有硬性 guard。
+	if a.stationsBusy() {
+		a.Warn("", "工位正在运行，无法修改配置")
+		return
+	}
 	ports, err := serial.ListPorts()
 	if err != nil {
-		dialog.ShowError(fmt.Errorf("枚举串口失败: %w", err), a.win)
-		return
-	}
-	if len(ports) == 0 {
-		dialog.ShowInformation("配置", "未发现可用串口", a.win)
-		return
+		// 枚举失败不中断弹框：警告写进日志面板，端口下拉留空由用户决定。
+		a.Warn("", "枚举串口失败: "+err.Error())
 	}
 
-	// 当前选中的串口：env.Vars["HeatNote"]["mbus"]["port"]。env 可能尚未
-	// Attach，这种情况下 mbusPort 留空，由用户从下拉里挑。
-	current := ""
+	// 当前已保存的串口与升级文件路径（env 可能尚未 Attach，此时均为空）。
 	a.mu.Lock()
-	if a.env != nil {
-		if hn, ok := a.env.Vars["HeatNote"].(map[string]any); ok {
-			if m, ok := hn["mbus"].(map[string]any); ok {
-				if p, ok := m["port"].(string); ok {
-					current = p
-				}
-			}
-		}
-	}
+	current, firmware := currentConfig(a.env)
 	a.mu.Unlock()
 
 	// 当前值若不在枚举结果里（设备被拔了），把它插到下拉首位以便显示。
@@ -1230,10 +1272,42 @@ func (a *App) promptConfig() {
 	}
 
 	sel := widget.NewSelect(ports, nil)
+	sel.PlaceHolder = "选择串口"
 	sel.SetSelected(current)
+
+	fwEntry := widget.NewEntry()
+	fwEntry.SetText(firmware)
+	fwEntry.SetPlaceHolder("未选择升级文件（可选）")
+
+	// 选择...：打开 .bin 过滤的文件选择框；已选路径时从其所在目录开始浏览。
+	pickBtn := widget.NewButton("选择...", func() {
+		fd := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
+			if err != nil || rc == nil {
+				return // 出错或取消：不动当前值
+			}
+			defer rc.Close()
+			// uri.Path() 是斜杠形式（file://C:/fw/a.bin），Windows 上
+			// 转回反斜杠并清理成绝对路径。
+			p := filepath.Clean(filepath.FromSlash(rc.URI().Path()))
+			if !filepath.IsAbs(p) {
+				if abs, aerr := filepath.Abs(p); aerr == nil {
+					p = abs
+				}
+			}
+			fwEntry.SetText(p)
+		}, a.win)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".bin"}))
+		if dir := filepath.Dir(fwEntry.Text); dir != "" && dir != "." {
+			if lister, lerr := storage.ListerForURI(storage.NewFileURI(dir)); lerr == nil {
+				fd.SetLocation(lister)
+			}
+		}
+		fd.Show()
+	})
 
 	items := []*widget.FormItem{
 		widget.NewFormItem("MBUS 串口", sel),
+		widget.NewFormItem("升级文件", container.NewBorder(nil, nil, nil, pickBtn, fwEntry)),
 	}
 	dialog.NewForm("配置", "保存", "取消", items, func(ok bool) {
 		if !ok {
@@ -1244,14 +1318,16 @@ func (a *App) promptConfig() {
 			a.Warn("", "未选择串口")
 			return
 		}
-		a.applyMBUSPort(picked)
+		a.applyConfig(picked, strings.TrimSpace(fwEntry.Text))
 	}, a.win).Show()
 }
 
-// applyMBUSPort 把新串口写进 env.Vars 并落盘到 ~/.blat/env.yml。
+// applyConfig 把新串口与升级文件（.bin，可空）写进 env.Vars 并落盘到
+// ~/.blat/env.yml。firmware 为空表示不配置升级文件——内存与落盘都不保留
+// firmware 键，env.yml 保持最小可读 schema。
 // env 为 nil（未 Attach）或 varsFile 为空（main 未注入）时直接返回——
 // 产品流程里都不会发生，防御性兜底。
-func (a *App) applyMBUSPort(port string) {
+func (a *App) applyConfig(port, firmware string) {
 	a.mu.Lock()
 	if a.env == nil {
 		a.mu.Unlock()
@@ -1263,6 +1339,16 @@ func (a *App) applyMBUSPort(port string) {
 		a.Warn("", "varsFile 尚未初始化（main 未注入），无法保存配置")
 		return
 	}
+	// 硬性 busy guard：任一工位含占位 boot 或正在运行时拒绝保存。运行中的
+	// 工位已按旧全局配置启动，此时改动会让三工位拿到不一致的全局
+	// firmware/串口。全部结束后恢复。
+	for _, r := range a.stationRuns {
+		if r != nil {
+			a.mu.Unlock()
+			a.Warn("", "工位正在运行，无法保存配置")
+			return
+		}
+	}
 	hn, _ := a.env.Vars["HeatNote"].(map[string]any)
 	if hn == nil {
 		hn = map[string]any{}
@@ -1272,30 +1358,71 @@ func (a *App) applyMBUSPort(port string) {
 		mbus = map[string]any{}
 	}
 	mbus["port"] = port
+	if firmware != "" {
+		mbus["firmware"] = firmware
+	} else {
+		// 清空升级文件时同步删掉内存里的键，保证运行态与落盘一致
+		delete(mbus, "firmware")
+	}
 	hn["mbus"] = mbus
 	a.env.Vars["HeatNote"] = hn
+	// 配置已变更：清空固件快照缓存（含 Data 引用）。busy guard 已保证此刻
+	// 无工位运行；下一轮 startStation 按新路径重建快照。
+	a.clearFirmwareSnapshot()
 	path := a.varsFile
 	a.mu.Unlock()
 
-	// 落盘只写用户配置（MBUS 串口）。env.yml schema 由我们控制——
-	// 不混入 TEST_WORKSTATION / HeatNote.bt_mock / HeatNote.plan / HeatNote.bluetooth
-	// 等运行时字段。这样 env.yml 始终保持最小可读 schema（用户给的样例：
-	// HeatNote.mbus.{baudRate,parity,port}），落在 ~/.blat/env.yml 即可——
-	// 即便程序安装到 %PROGRAMFILES%（只读目录）也能正常保存。
-	minimal := map[string]any{
-		"HeatNote": map[string]any{
-			"mbus": map[string]any{
-				"baudRate": config.DefaultMBUSBaudRate,
-				"parity":   config.DefaultMBUSParity,
-				"port":     port,
-			},
-		},
-	}
-	if err := config.SaveEnv(path, minimal); err != nil {
+	// 落盘只写用户配置（MBUS 串口 + 可选升级文件）。env.yml schema 由我们
+	// 控制——不混入 TEST_WORKSTATION / HeatNote.bt_mock / HeatNote.plan /
+	// HeatNote.bluetooth 等运行时字段。这样 env.yml 始终保持最小可读 schema
+	// （HeatNote.mbus.{baudRate,parity,port[,firmware]}），落在 ~/.blat/env.yml
+	// 即可——即便程序安装到 %PROGRAMFILES%（只读目录）也能正常保存。
+	if err := config.SaveEnv(path, buildMinimalEnv(port, firmware)); err != nil {
 		dialog.ShowError(fmt.Errorf("保存 %s 失败: %w", path, err), a.win)
 		return
 	}
-	a.Info("", "MBUS 串口已保存: "+port)
+	msg := "配置已保存: 串口 " + port
+	if firmware != "" {
+		msg += "，升级文件 " + filepath.Base(firmware)
+	}
+	a.Info("", msg)
+}
+
+// currentConfig 从 env.Vars["HeatNote"]["mbus"] 读当前串口与升级文件路径。
+// env 为 nil、Vars 未初始化或字段缺失/类型不对时返回空串，不 panic。
+func currentConfig(env *core.Env) (port, firmware string) {
+	if env == nil {
+		return "", ""
+	}
+	hn, _ := env.Vars["HeatNote"].(map[string]any)
+	if hn == nil {
+		return "", ""
+	}
+	m, _ := hn["mbus"].(map[string]any)
+	if m == nil {
+		return "", ""
+	}
+	port, _ = m["port"].(string)
+	firmware, _ = m["firmware"].(string)
+	return port, firmware
+}
+
+// buildMinimalEnv 构造落盘 env.yml 的最小 schema（只含 HeatNote.mbus）。
+// 始终包含 port；firmware 仅在非空时包含，保证 env.yml 最小可读。
+func buildMinimalEnv(port, firmware string) map[string]any {
+	mbus := map[string]any{
+		"baudRate": config.DefaultMBUSBaudRate,
+		"parity":   config.DefaultMBUSParity,
+		"port":     port,
+	}
+	if firmware != "" {
+		mbus["firmware"] = firmware
+	}
+	return map[string]any{
+		"HeatNote": map[string]any{
+			"mbus": mbus,
+		},
+	}
 }
 
 // serialFormatRe 序列号格式：可选 W 开头（不区分大小写）后接 12 位数字。

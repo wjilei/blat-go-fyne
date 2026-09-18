@@ -159,6 +159,7 @@ func TestIsPanelPlan(t *testing.T) {
 	}{
 		// PTVB1 面板模式计划：文件名含 PTVB1
 		{"confs/plan_PTVB1_normal_ut_checkmotor.yml", true},
+		{"confs/plan_PTVB1_normal_ut_upgradefirmware.yml", true},
 		{"plan_PTVB1_normal_ut_checkmotor.yml", true},
 		// 大小写不敏感
 		{"confs/plan_ptvb1_xxx.yml", true},
@@ -175,4 +176,3 @@ func TestIsPanelPlan(t *testing.T) {
 		}
 	}
 }
-

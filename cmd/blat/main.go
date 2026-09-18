@@ -49,6 +49,7 @@ var builtinPlans = []fyneui.PlanItem{
 	{Name: "平衡阀初始化电机", Path: "confs/plan_PSAV_normal_ut_resetvalve.yml"},
 	{Name: "平衡阀检查参数", Path: "confs/plan_PSAV_normal_ut_checkstate.yml"},
 	{Name: "户控阀检查电机状态", Path: "confs/plan_PTVB1_normal_ut_checkmotor.yml"},
+	{Name: "户控阀升级软件版本", Path: "confs/plan_PTVB1_normal_ut_upgradefirmware.yml"},
 }
 
 // planInList 报告 path 是否已存在于 items（按规范化路径比较）。
@@ -277,5 +278,9 @@ func runGUI(items []fyneui.PlanItem, selectPath string, vars map[string]any, deb
 	// Block on the Fyne event loop. Closing the window cancels any
 	// in-flight run via the SetOnClosed hook inside fyneui.New.
 	gui.Run()
+	// ShowAndRun 返回后再等待三工位完整收尾：此时 Fyne 事件循环已结束，
+	// 阻塞不会卡住主线程弹框；必须等报告、串口与设备生命周期结束后，main
+	// 才能返回并调用 os.Exit，避免升级帧或设备写 Flash 被进程直接中止。
+	gui.WaitStationShutdown()
 	return 0
 }

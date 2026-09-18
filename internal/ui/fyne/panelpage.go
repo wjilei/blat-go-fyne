@@ -5,7 +5,11 @@ package fyneui
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
 	"blat/internal/config"
@@ -21,6 +25,11 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 )
+
+// upgradeFirmwareCaseName 是面板升级计划必须包含的用例注册名，对齐
+// cmd/blat/cases/wire_valve_mbus.go 的 Register。仅当当前 plan 含该用例时，
+// 三工位才需要共享固件内容快照。
+const upgradeFirmwareCaseName = "HeatSuite::wire_valve_mbus_upgrade_firmware"
 
 // stationLogger 工位日志适配器：实现 core.Logger，把日志行写进工位 logf
 // （test_P<i>.log）并刷新对应面板日志框。每工位独立实例。
@@ -112,11 +121,106 @@ func (a *App) buildPanelPage() *fyne.Container {
 	return container.New(layout.NewGridLayout(3), panels...)
 }
 
+// firmwarePathForPlan 解析当前 plan 中升级用例所需的固件路径，解析顺序与
+// cmd/blat/cases/wire_valve_mbus.go 的 WireValveMBusUpgradeFirmwareCase 完全
+// 一致：
+//  1. plan 参数"升级文件"（中文，非空）优先；
+//  2. 英文 firmware 次之；
+//  3. 否则读基础 env HeatNote.mbus.firmware（GUI 配置写入的键）。
+//
+// 返回 (path, need)：need=false 表示当前 plan 不含升级用例，无需快照；
+// need=true 时 path 为解析出的路径（可能为空串——升级 plan 未配置固件，
+// 由调用方按错误处理）。
+func firmwarePathForPlan(plan *config.Plan, env *core.Env) (path string, need bool) {
+	if plan == nil || env == nil {
+		return "", false
+	}
+	for _, it := range plan.Cases {
+		if it.Name != upgradeFirmwareCaseName {
+			continue
+		}
+		if v, ok := it.Args["升级文件"].(string); ok && v != "" {
+			return v, true
+		}
+		// 英文 firmware：空串视作未配置（与 Case 的 Configure 一致——空路径
+		// 时 Run 回退 HeatNote.mbus.firmware），继续向下回退。
+		if v, ok := it.Args["firmware"].(string); ok && v != "" {
+			return v, true
+		}
+		if hn, ok := env.Vars["HeatNote"].(map[string]any); ok {
+			if m, ok := hn["mbus"].(map[string]any); ok {
+				if v, ok := m["firmware"].(string); ok {
+					return v, true
+				}
+			}
+		}
+		return "", true // 升级 plan 但没配路径：need=true，调用方报错
+	}
+	return "", false
+}
+
+// loadFirmwareSnapshot 在持有 a.mu 时调用：按当前 plan 决定是否需要固件
+// 快照并准备它。
+//   - 非升级 plan：清空缓存，返回 nil（不要求固件文件存在）。
+//   - 升级 plan 且缓存命中（同 plan 同路径）：直接复用，不重新读盘。
+//   - 升级 plan 且路径/plan 变化：读盘一次 + 计算 SHA-256 重建快照；
+//     读取失败、路径为空、非普通文件返回明确错误并清空缓存（升级 plan
+//     不允许三工位各自跳过）。
+//
+// 快照 Data 不写入 Vars——三工位通过各自 senv.Firmware 共享同一指针。
+func (a *App) loadFirmwareSnapshot() error {
+	path, need := firmwarePathForPlan(a.plan, a.env)
+	if !need {
+		a.clearFirmwareSnapshot()
+		return nil
+	}
+	if a.fwSnap != nil && a.fwSnapPlan == a.plan && a.fwSnapPath == path {
+		return nil // 同 plan 同路径：跨工位/跨轮次复用
+	}
+	if path == "" {
+		a.clearFirmwareSnapshot()
+		return fmt.Errorf("升级计划未配置固件文件（请配置 升级文件/firmware 参数或 HeatNote.mbus.firmware）")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		a.clearFirmwareSnapshot()
+		return fmt.Errorf("固件文件读取失败: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		a.clearFirmwareSnapshot()
+		return fmt.Errorf("固件路径不是普通文件: %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		a.clearFirmwareSnapshot()
+		return fmt.Errorf("固件文件读取失败: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	a.fwSnap = &core.FirmwareSnapshot{
+		Path:   path,
+		Data:   data,
+		Size:   int64(len(data)),
+		SHA256: hex.EncodeToString(sum[:]),
+	}
+	a.fwSnapPlan = a.plan
+	a.fwSnapPath = path
+	return nil
+}
+
+// clearFirmwareSnapshot 清空面板固件快照缓存并释放 Data 引用。配置变更、
+// 成功换 plan、清 plan、关窗时调用；必须在持有 a.mu 时调用。
+func (a *App) clearFirmwareSnapshot() {
+	a.fwSnap = nil
+	a.fwSnapPlan = nil
+	a.fwSnapPath = ""
+}
+
 // startStation 启动第 idx 号工位（idx 从 1 开始）的测试运行。
 // 由 stationPanel 的 SN 输入框回车回调触发（Fyne 主线程）。
-// 同步段只做锁检查 + 占位登记，重活（深拷贝 vars、打开日志、组装 reporter）
-// 全部交给后台 bootStation goroutine——让 OnSubmitted 回调快速释放主线程，
-// 避免 Windows 判定主消息循环"未响应"。
+// 同步段在 a.mu 内完成锁检查 + 共享 env.Vars 深拷贝快照 + 占位登记；
+// 其余重活（打开日志、组装 reporter）交给后台 bootStation goroutine——
+// 让 OnSubmitted 回调快速释放主线程，避免 Windows 判定主消息循环"未响应"。
+// vars 快照必须在锁内生成：applyConfig 可能并发改写共享 env.Vars。
 func (a *App) startStation(idx int, sn, port string) error {
 	// 槽位占用检查 + 取共享资源（mu 保护）
 	a.mu.Lock()
@@ -169,19 +273,41 @@ func (a *App) startStation(idx int, sn, port string) error {
 			return fmt.Errorf("设备%d 序列号 %s 正在测试（设备%d）", idx, sn, i+1)
 		}
 	}
+	// 固件快照：仅升级 plan 需要。第一个工位在登记占位前、a.mu 内读盘一次
+	// 并计算 SHA-256，后续工位/轮次复用同一快照（跨工位共享同一指针）；
+	// 读取失败/未配置/非普通文件返回明确错误，不登记占位、不启动任何槽位
+	//（升级 plan 不允许三路各自跳过）。
+	if err := a.loadFirmwareSnapshot(); err != nil {
+		a.mu.Unlock()
+		cancel()
+		return err
+	}
+	// 在锁内生成工位私有 vars 快照：applyConfig 可能并发改写共享 env.Vars
+	//（配置弹框保存），深拷贝必须在 a.mu 内完成，防止 bootStation 无锁遍历
+	// 共享 map 造成数据竞争（go test -race 可检出）。工位各自的 serial/port
+	// 覆盖由 bootStation 在快照上完成。fwSnap 在锁内捕获：快照对象不可变，
+	// 三工位共享同一指针是安全的。
+	fwSnap := a.fwSnap
+	vars := deepCopyVars(env.Vars)
 	a.stationRuns[idx-1] = placeholder
+	a.stationWG.Add(1)
 	a.mu.Unlock()
 
 	// 后台做重活；立即返回 nil 让 OnSubmitted 释放主线程
-	go a.bootStation(idx, sn, port, plan, reg, env, debug, placeholder, ctx)
+	go a.bootStation(idx, sn, port, plan, reg, vars, fwSnap, env, debug, placeholder, ctx)
 	return nil
 }
 
-// bootStation 后台执行 startStation 后半段重活（深拷贝 vars、打开日志、
-// 组装 reporter）+ RunPlan + 收尾。占位 placeholder 在重活完成后 CAS 替换
-// 为真 run；已被 stopStation 清掉占位则放弃本次启动。
-func (a *App) bootStation(idx int, sn, port string, plan *config.Plan, reg *runtime.Registry, env *core.Env, debug bool, placeholder *stationRun, ctx context.Context) {
+// bootStation 后台执行 startStation 后半段重活（在私有 vars 快照上覆盖
+// serial/port、打开日志、组装 reporter）+ RunPlan + 收尾。占位 placeholder
+// 在重活完成后 CAS 替换为真 run；已被 stopStation 清掉占位则放弃本次启动。
+// vars 是 startStation 在 a.mu 内生成的深拷贝快照，工位私有，可自由读写；
+// fwSnap 是 startStation 在 a.mu 内捕获的共享固件快照（升级 plan 专用，
+// 非升级 plan 为 nil），三工位指向同一份 Data/SHA256。
+func (a *App) bootStation(idx int, sn, port string, plan *config.Plan, reg *runtime.Registry, vars map[string]any, fwSnap *core.FirmwareSnapshot, env *core.Env, debug bool, placeholder *stationRun, ctx context.Context) {
 	cancel := placeholder.cancel
+	// 关窗收尾（stopAllStations）等待所有工位 goroutine 退出的记账点
+	defer a.stationWG.Done()
 	if idx < 1 || idx > len(a.stations) {
 		cancel()
 		return
@@ -197,10 +323,12 @@ func (a *App) bootStation(idx int, sn, port string, plan *config.Plan, reg *runt
 		return
 	}
 
-	// 重活：深拷贝 vars（HeatNote 副本已删除 mbus_dev/bluetooth，防单跑遗留
-	// 设备实例被三工位共享——串口独占冲突）+ 覆盖 HeatNote["serial"]=sn、
-	// HeatNote["mbus"]["port"]=port（子 map 不存在则创建）。
-	vars := deepCopyVars(env.Vars)
+	// 重活：在私有快照上覆盖 HeatNote["serial"]=sn、
+	// HeatNote["mbus"]["port"]=port（子 map 不存在则创建）。快照已删除
+	// mbus_dev/bluetooth，防单跑遗留设备实例被三工位共享——串口独占冲突。
+	if vars == nil {
+		vars = map[string]any{}
+	}
 	hn, _ := vars["HeatNote"].(map[string]any)
 	if hn == nil {
 		hn = map[string]any{}
@@ -301,14 +429,14 @@ func (a *App) bootStation(idx int, sn, port string, plan *config.Plan, reg *runt
 		}
 	}
 
-	senv := &core.Env{
-		Ctx:  ctx,
-		Log:  stationLog,
-		UI:   newStationUI(a, fmt.Sprintf("设备%d", idx)),
-		Vars: vars,
-		Devs: env.Devs,
-		Out:  env.Out,
-	}
+	// 独立 env：Ctx=ctx、Vars=vars、Devs 浅拷贝、Log=工位 logger、
+	// UI=stationUI（文案加【设备N】前缀）、Out 沿用；Firmware 指向共享
+	// 固件快照（升级 plan 专用，可为 nil）。
+	senv := newStationEnv(
+		ctx, vars, env.Devs, env.Out,
+		stationLog, newStationUI(a, fmt.Sprintf("设备%d", idx)),
+		fwSnap,
+	)
 
 	// 组装 stationRun（logOff/logGen 初始 0；plan/reg 与单跑共享只读）。
 	run := &stationRun{
@@ -420,6 +548,21 @@ func (a *App) bootStation(idx int, sn, port string, plan *config.Plan, reg *runt
 	panel.SetState(finalState, finalSum)
 }
 
+// newStationEnv 组装工位私有 core.Env：vars 是 startStation 生成的深拷贝
+// 快照（工位私有，可自由读写）；fwSnap 是三工位共享的固件内容快照（升级
+// plan 专用，非升级 plan 为 nil）。抽成纯函数便于单测验证 Firmware 接线。
+func newStationEnv(ctx context.Context, vars map[string]any, devs map[string]any, out io.Writer, log core.Logger, ui core.UI, fwSnap *core.FirmwareSnapshot) *core.Env {
+	return &core.Env{
+		Ctx:      ctx,
+		Log:      log,
+		UI:       ui,
+		Vars:     vars,
+		Devs:     devs,
+		Out:      out,
+		Firmware: fwSnap,
+	}
+}
+
 // stationMBUS 是某工位长期持有的 M-Bus 设备缓存：记录设备实例及其连接
 // 参数（串口 port + mock 模式）。同参数复用同一设备（Connect 幂等不重开
 // 串口），参数变化时才摘除并 Disconnect。
@@ -427,6 +570,11 @@ type stationMBUS struct {
 	dev  *mbus.Device
 	port string
 	mock bool
+	// inUse 标记该缓存设备正被某个活跃 run 复用（stationMBUSFor 命中时置位，
+	// storeStationMBUS 写回新条目时清位）。受 a.mu 保护。stopAllStations 关闭
+	// 时跳过 inUse 设备——由运行中的 bootStation 收尾断开，避免活跃事务期间
+	// 提前 Disconnect；未被活跃 run 使用的缓存设备可立即关闭。
+	inUse bool
 }
 
 // stationMBUSFor 按工位 idx（1..3）查询 M-Bus 缓存：
@@ -457,6 +605,10 @@ func (a *App) stationMBUSFor(idx int, port string, mock bool) (dev *mbus.Device,
 		return nil, false, false
 	}
 	if c.port == port && c.mock == mock {
+		// 命中：设备交给本工位 run 使用，标记 inUse——stopAllStations 关窗
+		// 时不再立即断开它，改由该 run 的收尾（storeStationMBUS closing 路径）
+		// 断开，避免活跃事务期间提前 Disconnect。
+		c.inUse = true
 		a.mu.Unlock()
 		return c.dev, true, false
 	}
@@ -532,28 +684,103 @@ func (a *App) stopStation(idx int) {
 
 // stopAllStations 停止所有工位运行（关窗时级联调用）。先置 stationsClosing
 // 标记：此后 startStation 拒绝新启动、storeStationMBUS 不再写缓存而直接断开
-// 设备。抓取运行列表 cancel，再从缓存摘除并锁外 Disconnect 全部设备——
-// active run 若之后终态收尾，看到 closing 会断开自己的私有 mbus_dev 且不
-// 重新缓存（storeStationMBUS 内部处理），不会产生泄漏或重新缓存已断开设备。
+// 设备。然后：
+//   - 立即断开"未被活跃 run 使用"的缓存设备（inUse=false，空闲缓存）；
+//   - 正在被活跃 run 复用的设备（inUse=true）**不在此断开**——由对应
+//     bootStation 的收尾（storeStationMBUS 看到 closing 后直接 Disconnect）
+//     断开，避免 cancel 后立即 Disconnect 活跃事务正在使用的设备；
+//   - 收尾等待放后台 goroutine（finishStationShutdown）：等所有工位 goroutine
+//     退出后再统一清缓存。等待不能阻塞 Fyne 主线程——bootStation 收尾里的
+//     panel.SetState 经 fyne.Do 需要主线程处理，主线程被阻塞会死锁。
 func (a *App) stopAllStations() {
 	a.mu.Lock()
 	a.stationsClosing = true
+	// 应用关闭：释放固件快照引用（Data 由进程退出兜底回收）。
+	a.clearFirmwareSnapshot()
 	runs := append([]*stationRun(nil), a.stationRuns...)
+	// 摘除并断开未被活跃 run 使用的缓存设备；inUse 设备留给 run 收尾
+	var idle []*mbus.Device
+	for i, c := range a.stationMBUS {
+		if c != nil && !c.inUse {
+			idle = append(idle, c.dev)
+			a.stationMBUS[i] = nil
+		}
+	}
 	a.mu.Unlock()
 	for _, r := range runs {
 		if r != nil && r.cancel != nil {
 			r.cancel()
 		}
 	}
-	// 关窗收尾：断开所有工位缓存的 M-Bus 设备（与运行中的 cancel 无耦合——
-	// 缓存只保存终态写回/复用的设备，运行中新创建尚未写回的设备由终态
-	// storeStationMBUS 看到 closing 后自行断开）。
+	for _, d := range idle {
+		if d != nil {
+			_ = d.Disconnect()
+		}
+	}
+	go a.finishStationShutdown()
+}
+
+// finishStationShutdown 等待所有工位 goroutine（bootStation，含占位放弃路径）
+// 退出后，统一摘除并断开剩余缓存设备，最后关闭完成信号
+// （stationShutdownDone，经 Once 只关一次）。在后台 goroutine 中执行，避免
+// 阻塞 Fyne 主线程（bootStation 收尾的 fyne.Do 需要主线程处理）。
+func (a *App) finishStationShutdown() {
+	a.stationWG.Wait()
 	a.clearStationMBUS()
+	a.stationShutdownOnce.Do(func() { close(a.stationShutdownDone) })
+}
+
+// WaitStationShutdown 等待关窗后全部工位 goroutine 退出并完成缓存清理。
+// 供 main 在 ShowAndRun() 返回后调用——此时事件循环已结束、主线程空闲，
+// 阻塞等待不会卡住 bootStation 收尾的 fyne.Do。重复调用安全（完成信号
+// 只关闭一次）。若 stopAllStations 尚未被触发（异常退出路径），先补一次
+// 收尾，避免永久阻塞。
+func (a *App) WaitStationShutdown() {
+	a.mu.Lock()
+	closing := a.stationsClosing
+	a.mu.Unlock()
+	if !closing {
+		a.stopAllStations()
+	}
+	<-a.stationShutdownDone
+}
+
+// stationsBusy 返回任一工位正在运行（含占位 boot 阶段）。此时不允许修改
+// 配置或切换计划：运行中的工位已按旧全局值启动，改动会让三工位拿到不一致
+// 的全局配置（firmware/串口），且运行中覆盖 a.plan 会破坏下一轮语义。
+func (a *App) stationsBusy() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, r := range a.stationRuns {
+		if r != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// notifyReject 是主线程拒绝路径的非阻塞提示：switchMode/onPlanSelected 等
+// 由计划下拉框回调（Fyne 主线程）触发，若直接同步调 a.Message 会自死锁——
+// a.Message 等待弹框 reply，而 pump 弹框经 fyne.Do 依赖主线程处理事件队列，
+// 主线程被自己阻塞。故放后台 goroutine；shutdown 关闭时 Message 立即返回
+// （无 goroutine 泄漏），测试环境同样安全。
+func (a *App) notifyReject(msg string) {
+	go func() {
+		_ = a.Message(context.Background(), msg, false)
+	}()
 }
 
 // switchMode 切换界面模式（single ↔ panel）。目标模式与当前一致时直接返回
 // true；切换被拒绝（另一模式有运行中任务）时弹提示并返回 false，不做自动强停。
+//
+// 面板目标（含 panel→panel 换计划）：任一工位含占位 boot 或正在运行都拒绝，
+// 防止运行中覆盖全局 a.plan——运行中的工位各自持有启动时的 plan 快照，切走
+// 会让 UI 展示的全局计划与运行不一致。
 func (a *App) switchMode(isPanel bool) bool {
+	if isPanel && a.stationsBusy() {
+		a.notifyReject("请先停止工位测试")
+		return false
+	}
 	a.mu.Lock()
 	cur := a.mode
 	a.mu.Unlock()
@@ -567,22 +794,13 @@ func (a *App) switchMode(isPanel bool) bool {
 	if isPanel {
 		// 切到面板：单跑模式有活跃 run 时拒绝（查 runCtx 机制，见 running()）。
 		if a.running() {
-			_ = a.Message(context.Background(), "请先停止当前测试", false)
+			a.notifyReject("请先停止当前测试")
 			return false
 		}
 	} else {
 		// 切到单跑：任一工位在跑时拒绝。
-		a.mu.Lock()
-		busy := false
-		for _, r := range a.stationRuns {
-			if r != nil {
-				busy = true
-				break
-			}
-		}
-		a.mu.Unlock()
-		if busy {
-			_ = a.Message(context.Background(), "请先停止工位测试", false)
+		if a.stationsBusy() {
+			a.notifyReject("请先停止工位测试")
 			return false
 		}
 	}

@@ -110,7 +110,7 @@ func TestDeepCopyVarsNested(t *testing.T) {
 	orig := map[string]any{
 		"HeatNote": map[string]any{
 			"serial":    "123456",
-			"mbus":      map[string]any{"port": "COM9"},
+			"mbus":      map[string]any{"port": "COM9", "firmware": `C:\fw\upgrade.bin`},
 			"mbus_dev":  &struct{ name string }{name: "dev"},
 			"bluetooth": &struct{ name string }{name: "bt"},
 		},
@@ -129,6 +129,9 @@ func TestDeepCopyVarsNested(t *testing.T) {
 	}
 	if orig["HeatNote"].(map[string]any)["mbus"].(map[string]any)["port"] != "COM9" {
 		t.Error("嵌套 map 修改泄漏到原 vars")
+	}
+	if got := hn["mbus"].(map[string]any)["firmware"]; got != `C:\fw\upgrade.bin` {
+		t.Errorf("工位拷贝未保留全局升级文件: got %v", got)
 	}
 	if orig["top"].([]any)[1].(map[string]any)["k"] != "v" {
 		t.Error("slice 修改泄漏到原 vars")

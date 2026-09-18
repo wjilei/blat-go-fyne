@@ -43,14 +43,32 @@ func (c *captureLogger) Reset() {
 // ---- fake Port（测试注入，不触真实串口）----
 
 // fakePort 实现 serial.Port：Write 记录帧；Read 按 chunks 依次返回，
-// chunks 耗尽后返回 (0, nil)（模拟无数据）；err 非 nil 时 Read 返回错误。
+// chunks 耗尽后返回 (0, nil)（模拟无数据）；repeat 非空时 chunks 耗尽后
+// Read 反复返回 repeat 字节（模拟响应持续在线，供升级 E2E 测试用）；
+// err 非 nil 时 Read 返回错误。默认 repeat 为 nil，不影响既有测试行为。
+//
+// 写侧模拟：writeErr 非 nil 时 Write 直接返回该错误（明确写错误，走 retry
+// 语义）；writeShortFrom > 0 时从第 writeShortFrom 次 Write 起只写 1 字节
+// 并返回 (1, nil)，模拟串口半帧短写（err==nil 但 n < len(frame)）。
 type fakePort struct {
-	written [][]byte
-	chunks  [][]byte
-	err     error
+	written        [][]byte
+	chunks         [][]byte
+	repeat         []byte
+	writeErr       error
+	writeShortFrom int // >0：从第 writeShortFrom 次 Write 起短写（只写 1 字节）
+	writeCount     int
+	err            error
 }
 
 func (f *fakePort) Write(b []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	f.writeCount++
+	if f.writeShortFrom > 0 && f.writeCount >= f.writeShortFrom {
+		f.written = append(f.written, append([]byte(nil), b[:1]...))
+		return 1, nil
+	}
 	f.written = append(f.written, append([]byte(nil), b...))
 	return len(b), nil
 }
@@ -60,6 +78,9 @@ func (f *fakePort) Read(buf []byte) (int, error) {
 		c := f.chunks[0]
 		f.chunks = f.chunks[1:]
 		return copy(buf, c), nil
+	}
+	if len(f.repeat) > 0 {
+		return copy(buf, f.repeat), nil
 	}
 	if f.err != nil {
 		return 0, f.err
@@ -644,8 +665,8 @@ func TestParseInfoResponse(t *testing.T) {
 	// 格式异常
 	for _, bad := range []string{
 		"",
-		"FEFEFE6800000000000000000003BB1F0100",  // BB1F 帧
-		"FEFEFE6800000000000000000014BB1E01",    // 缺数据
+		"FEFEFE6800000000000000000003BB1F0100", // BB1F 帧
+		"FEFEFE6800000000000000000014BB1E01",   // 缺数据
 		"FEFEFE6800000000000000000014BB1E01C4090000D00700002D01020", // 缺末字节
 	} {
 		if _, err := parseInfoResponse(bad); err == nil {
@@ -893,5 +914,457 @@ func TestMakeMBusMatcher_ShortACK(t *testing.T) {
 func TestParseSetValveResponse_ShortACK(t *testing.T) {
 	if err := parseSetValveResponse("E5"); err != nil {
 		t.Errorf("parseSetValveResponse(E5) 应为 nil, 却得到: %v", err)
+	}
+}
+
+// ---- UPGRADE_REQ（BB20）固件升级（对应 Perl UserValve.pm dev_get_mbus_data
+// "UPGRADE_REQ" L162-175 + dev_mbus_fill_set_cmd BB20 分支 L278-300 +
+// UpgradeByMbus L680-717）----
+
+func TestBuildUpgradeFrame_Layout(t *testing.T) {
+	frame, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer:   8,
+		SoftVer:   5,
+		BlockID:   1,
+		BlockSize: 128,
+		IsEnd:     false,
+		Data:      make([]byte, 128),
+	})
+	if err != nil {
+		t.Fatalf("buildUpgradeFrame 意外错误: %v", err)
+	}
+	if len(frame) != 155 {
+		t.Fatalf("帧长度 = %d, 期望 155", len(frame))
+	}
+	if frame[13] != 0x8b {
+		t.Fatalf("data_len = %02x, 期望 8b（155-16）", frame[13])
+	}
+	if frame[14] != 0xbb || frame[15] != 0x20 {
+		t.Fatalf("cmd_id = %02x%02x, 期望 bb20", frame[14], frame[15])
+	}
+	if frame[19] != 8 || frame[20] != 5 {
+		t.Fatalf("hard_ver/soft_ver = %02x/%02x, 期望 08/05", frame[19], frame[20])
+	}
+	if frame[21] != 1 || frame[22] != 0 {
+		t.Fatalf("block_id LE = %02x%02x, 期望 01 00", frame[21], frame[22])
+	}
+	if frame[23] != 128 {
+		t.Fatalf("block_size = %02x, 期望 80", frame[23])
+	}
+	if frame[24] != 0 {
+		t.Fatalf("is_end = %02x, 期望 00", frame[24])
+	}
+	// 设备 ID：12 位 mac 倒序字节对（与 buildReadMotorFrame 同序）
+	// "262601300011" → 11 00 30 01 26 26 填 5..10，[11] 保持 0
+	want := []byte{0x11, 0x00, 0x30, 0x01, 0x26, 0x26}
+	for i, v := range want {
+		if frame[5+i] != v {
+			t.Fatalf("frame[%d] = %02x, 期望 %02x", 5+i, frame[5+i], v)
+		}
+	}
+	if frame[11] != 0 {
+		t.Fatalf("frame[11] = %02x, 期望 00（12 位 mac 的 7 字节 ID 末字节）", frame[11])
+	}
+	// CS = sum(3..152) & 0xff（cmd_len = data_len+14 = 153，Perl L317-322）
+	var cs byte
+	for i := 3; i <= 152; i++ {
+		cs += frame[i]
+	}
+	if frame[153] != cs {
+		t.Fatalf("CS = %02x, 期望 %02x", frame[153], cs)
+	}
+	if frame[154] != 0x16 {
+		t.Fatalf("结束符 = %02x, 期望 16", frame[154])
+	}
+}
+
+func TestBuildUpgradeFrame_ShortPayloadZeroPadded(t *testing.T) {
+	frame, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer:   1,
+		SoftVer:   1,
+		BlockID:   7,
+		BlockSize: 3,
+		IsEnd:     true,
+		Data:      []byte("ABC"),
+	})
+	if err != nil {
+		t.Fatalf("buildUpgradeFrame 意外错误: %v", err)
+	}
+	if string(frame[25:28]) != "ABC" {
+		t.Fatalf("payload = %q, 期望 ABC", frame[25:28])
+	}
+	if frame[28] != 0 || frame[152] != 0 {
+		t.Fatalf("payload 剩余部分应为 0: frame[28]=%02x frame[152]=%02x", frame[28], frame[152])
+	}
+	if frame[23] != 3 {
+		t.Fatalf("block_size = %02x, 期望 03（BlockSize 原样写入）", frame[23])
+	}
+	if frame[24] != 1 {
+		t.Fatalf("is_end = %02x, 期望 01", frame[24])
+	}
+}
+
+// TestBuildUpgradeFrame_InvalidBlock 校验 buildUpgradeFrame 的参数校验
+// （oracle 审查强化）：BlockID 0..65535、Data 长度 1..128、BlockSize 必须
+// == len(Data) 且 <=128。非法返回 error，不静默截断（替换旧截断行为）。
+func TestBuildUpgradeFrame_InvalidBlock(t *testing.T) {
+	// Data 超 128 字节：拒绝（不再静默截断）
+	if _, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer: 1, SoftVer: 2, BlockID: 3, BlockSize: 200, Data: make([]byte, 200),
+	}); err == nil {
+		t.Error("Data 200 字节应返回错误（不得静默截断）")
+	}
+	// BlockSize != len(Data)
+	if _, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer: 1, SoftVer: 2, BlockID: 3, BlockSize: 4, Data: []byte("ABC"),
+	}); err == nil {
+		t.Error("BlockSize != len(Data) 应返回错误")
+	}
+	// BlockSize > 128
+	if _, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer: 1, SoftVer: 2, BlockID: 3, BlockSize: 129, Data: make([]byte, 129),
+	}); err == nil {
+		t.Error("BlockSize 129 应返回错误")
+	}
+	// 空 Data
+	if _, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer: 1, SoftVer: 2, BlockID: 3, BlockSize: 0, Data: nil,
+	}); err == nil {
+		t.Error("空 Data 应返回错误")
+	}
+	// BlockID 超 65535 / 负数
+	for _, id := range []int{65536, -1} {
+		if _, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+			HardVer: 1, SoftVer: 2, BlockID: id, BlockSize: 3, Data: []byte("ABC"),
+		}); err == nil {
+			t.Errorf("BlockID=%d 应返回错误", id)
+		}
+	}
+	// 边界合法：BlockID=65535、Data 128 字节
+	if _, err := buildUpgradeFrame("262601300011", UpgradeBlock{
+		HardVer: 1, SoftVer: 2, BlockID: 65535, BlockSize: 128, Data: make([]byte, 128),
+	}); err != nil {
+		t.Errorf("边界合法块不应报错: %v", err)
+	}
+}
+
+func TestBuildUpgradeFrame_InvalidMAC(t *testing.T) {
+	for _, mac := range []string{"26260130001", "2626013000111", "2626a1300011", "", "abc"} {
+		if _, err := buildUpgradeFrame(mac, UpgradeBlock{HardVer: 1, SoftVer: 1, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}); err == nil {
+			t.Errorf("mac %q 应返回错误", mac)
+		}
+	}
+}
+
+// buildTestUpgradeResponse 构造 BB20 升级响应帧（22 字节，新固件格式）：
+// FE FE FE 68 20 + 7 字节 00（addr）+ 81 06（L=0x06）+ BB 20 01 + devRet(1B)
+// + nextBlockID(2B LE) + CS + 16。CS = sum(字节 3..19) & 0xff，可通过
+// makeMBusMatcher("BB20") 校验。
+func buildTestUpgradeResponse(devRet byte, nextBlockID uint16) string {
+	f := []byte{0xfe, 0xfe, 0xfe, 0x68, 0x20}
+	f = append(f, make([]byte, 7)...) // addr 7 字节
+	f = append(f, 0x81, 0x06)         // L=0x06（数据 6 字节）
+	f = append(f, 0xbb, 0x20, 0x01)   // cmd_id BB20 + sub_id
+	f = append(f, devRet)
+	f = append(f, byte(nextBlockID), byte(nextBlockID>>8))
+	var cs byte
+	for i := 3; i <= 19; i++ {
+		cs += f[i]
+	}
+	f = append(f, cs, 0x16)
+	return strings.ToUpper(hex.EncodeToString(f))
+}
+
+func TestParseUpgradeResponse(t *testing.T) {
+	// 合法响应：devRet=0x00, nextBlockID=1
+	ret := buildTestUpgradeResponse(0x00, 1)
+	devRet, next, ok := parseUpgradeResponse(ret)
+	if !ok {
+		t.Fatalf("合法升级响应应解析成功: %s", ret)
+	}
+	if devRet != 0 || next != 1 {
+		t.Fatalf("devRet=%d nextBlockID=%d, 期望 0/1", devRet, next)
+	}
+	// 交叉验证其它值
+	ret = buildTestUpgradeResponse(0xab, 0x1234)
+	devRet, next, ok = parseUpgradeResponse(ret)
+	if !ok || devRet != 0xab || next != 0x1234 {
+		t.Fatalf("devRet=%d nextBlockID=%d ok=%v, 期望 ab/0x1234/true", devRet, next, ok)
+	}
+	// 格式异常 → ok=false
+	for _, bad := range []string{
+		"",
+		"E5",
+		buildTestUpgradeResponse(0x00, 1)[:40], // 缺 CS/16 结尾
+	} {
+		if _, _, ok := parseUpgradeResponse(bad); ok {
+			t.Errorf("输入 %q 应解析失败", bad)
+		}
+	}
+	// \w 命中但非合法 hex（替换 devRet 字节为 GZ）→ hex 解码失败 → ok=false
+	bad := buildTestUpgradeResponse(0x00, 1)
+	bad = bad[:34] + "GZ" + bad[36:]
+	if _, _, ok := parseUpgradeResponse(bad); ok {
+		t.Errorf("非 hex 输入 %q 应解析失败", bad)
+	}
+}
+
+func TestMockDevice_UpgradeByMbus(t *testing.T) {
+	d := NewMockDevice()
+	ctx := context.Background()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 128, Data: make([]byte, 128)}
+
+	// 未 Connect → 错误
+	if err := d.UpgradeByMbus(ctx, "262601300011", blk); err == nil {
+		t.Fatal("未连接时应返回错误")
+	}
+
+	if err := d.Connect(ctx, "COM9"); err != nil {
+		t.Fatalf("Connect 意外错误: %v", err)
+	}
+	// 记录升级块
+	if err := d.UpgradeByMbus(ctx, "262601300011", blk); err != nil {
+		t.Fatalf("mock UpgradeByMbus 意外错误: %v", err)
+	}
+	blocks := d.MockUpgradeBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("记录的升级块数 = %d, 期望 1", len(blocks))
+	}
+	if blocks[0].BlockID != 1 || blocks[0].HardVer != 8 || blocks[0].SoftVer != 5 {
+		t.Fatalf("记录的升级块内容错误: %+v", blocks[0])
+	}
+	// 注入错误 → 返回该错误
+	d.SetMockUpgradeError(errors.New("boom"))
+	if err := d.UpgradeByMbus(ctx, "262601300011", blk); err == nil || err.Error() != "boom" {
+		t.Fatalf("SetMockUpgradeError 后应返回注入错误, got %v", err)
+	}
+	// 清除错误后再成功
+	d.SetMockUpgradeError(nil)
+	if err := d.UpgradeByMbus(ctx, "262601300011", blk); err != nil {
+		t.Fatalf("清除 mock 错误后应成功: %v", err)
+	}
+	if got := len(d.MockUpgradeBlocks()); got != 3 {
+		t.Fatalf("升级块记录数 = %d, 期望 3", got)
+	}
+	// ctx 取消短路
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.UpgradeByMbus(ctxCancel, "262601300011", blk); !errors.Is(err, context.Canceled) {
+		t.Errorf("取消 ctx 应返回 context.Canceled, got %v", err)
+	}
+}
+
+// TestRealDevice_UpgradeByMbus_EndToEnd 校验 real 路径完整往返：先发
+// address dummy 唤醒帧（结果丢弃，50ms 读超时是预期）→ 再发 155 字节
+// BB20 升级帧 → 命中 22 字节新固件响应（devRet=0、nextBlockID=BlockID+1）
+// → 返回 nil。断言写了两帧且第二帧 cmd_id=BB20。
+func TestRealDevice_UpgradeByMbus_EndToEnd(t *testing.T) {
+	// BlockID=1 → 期望 next_block_id=2（新格式响应校验）
+	raw, err := hex.DecodeString(buildTestUpgradeResponse(0x00, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// repeat：chunks 耗尽后 Read 持续返回响应字节，供 dummy 唤醒帧与
+	// 升级帧两次 commandTrans 读取。
+	port := &fakePort{repeat: raw}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+
+	blk := UpgradeBlock{
+		HardVer:   8,
+		SoftVer:   5,
+		BlockID:   1,
+		BlockSize: 3,
+		IsEnd:     true,
+		Data:      []byte("ABC"),
+	}
+	if err := d.UpgradeByMbus(context.Background(), "262601300011", blk); err != nil {
+		t.Fatalf("UpgradeByMbus 端到端意外错误: %v", err)
+	}
+	if len(port.written) != 2 {
+		t.Fatalf("写入帧数 = %d, 期望 2（dummy + 升级帧）", len(port.written))
+	}
+	up := port.written[1]
+	if len(up) != 155 {
+		t.Fatalf("升级帧长度 = %d, 期望 155", len(up))
+	}
+	if up[14] != 0xbb || up[15] != 0x20 {
+		t.Fatalf("升级帧 cmd_id = %02x%02x, 期望 bb20", up[14], up[15])
+	}
+}
+
+// buildTestUpgradeOldResponse 构造旧固件格式 BB20 响应帧（19 字节，L=0x03，
+// 数据区不含 ret/next_block_id）：不匹配新格式正则，视为旧格式成功。
+func buildTestUpgradeOldResponse() string {
+	f := []byte{0xfe, 0xfe, 0xfe, 0x68}
+	f = append(f, make([]byte, 9)...) // L + ID(6) + ext + C
+	f = append(f, 0x03, 0xbb, 0x20, 0x01)
+	var cs byte
+	for i := 3; i <= 16; i++ {
+		cs += f[i]
+	}
+	f = append(f, cs, 0x16)
+	return strings.ToUpper(hex.EncodeToString(f))
+}
+
+// TestRealDevice_UpgradeByMbus_DevRetNonZero 校验新格式响应 devRet 非 0
+// （设备拒绝该块）必须返回错误（oracle 审查：Perl 原版只打日志不检查）。
+func TestRealDevice_UpgradeByMbus_DevRetNonZero(t *testing.T) {
+	raw, _ := hex.DecodeString(buildTestUpgradeResponse(0x01, 2)) // ret=1 非 0
+	port := &fakePort{repeat: raw}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}
+	err := d.UpgradeByMbus(context.Background(), "262601300011", blk)
+	if err == nil || !strings.Contains(err.Error(), "ret=0x01") {
+		t.Fatalf("devRet 非 0 应报错含 ret=0x01, got %v", err)
+	}
+}
+
+// TestRealDevice_UpgradeByMbus_WrongNextBlockID 校验 next_block_id 不符合
+// 预期（BlockID+1）时返回错误。
+func TestRealDevice_UpgradeByMbus_WrongNextBlockID(t *testing.T) {
+	raw, _ := hex.DecodeString(buildTestUpgradeResponse(0x00, 3)) // BlockID=1 期望 2
+	port := &fakePort{repeat: raw}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}
+	err := d.UpgradeByMbus(context.Background(), "262601300011", blk)
+	if err == nil || !strings.Contains(err.Error(), "next_block_id=3") {
+		t.Fatalf("next_block_id 不符应报错, got %v", err)
+	}
+}
+
+// TestRealDevice_UpgradeByMbus_OldFormatOK 校验旧固件响应（不匹配新格式
+// 正则）保持兼容：不校验应答，视为发送成功。
+func TestRealDevice_UpgradeByMbus_OldFormatOK(t *testing.T) {
+	raw, _ := hex.DecodeString(buildTestUpgradeOldResponse())
+	port := &fakePort{repeat: raw}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}
+	if err := d.UpgradeByMbus(context.Background(), "262601300011", blk); err != nil {
+		t.Fatalf("旧格式响应应成功, got %v", err)
+	}
+}
+
+// TestRealDevice_UpgradeByMbus_DummyWriteError 校验 dummy 唤醒帧真实写
+// 失败必须可观测并失败（与"无响应超时可继续"区分，oracle 审查）。
+func TestRealDevice_UpgradeByMbus_DummyWriteError(t *testing.T) {
+	port := &fakePort{writeErr: errors.New("port closed")}
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}
+	err := d.UpgradeByMbus(context.Background(), "262601300011", blk)
+	if err == nil || !strings.Contains(err.Error(), "升级唤醒帧发送失败") {
+		t.Fatalf("dummy 写失败应报「升级唤醒帧发送失败」, got %v", err)
+	}
+	if len(port.written) != 0 {
+		t.Fatalf("写失败不应记录任何帧, 实际 %d", len(port.written))
+	}
+}
+
+// TestCommandTrans_WriteFailure 校验 commandTrans 全 retry 写失败时返回
+// errMBusWrite（区别于超时），供 UpgradeByMbus 判定 dummy 写错误。
+func TestCommandTrans_WriteFailure(t *testing.T) {
+	frame, err := buildReadMotorFrame("262601300011")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := &fakePort{writeErr: errors.New("port closed")}
+	d := NewMockDevice()
+	_, err = d.commandTrans(context.Background(), port, frame, time.Second, 3)
+	if !errors.Is(err, errMBusWrite) {
+		t.Fatalf("全部 retry 写失败应返回 errMBusWrite, got %v", err)
+	}
+}
+
+// TestMockDevice_UpgradeByMbus_InvalidBlock 校验 mock 路径同样执行参数校验：
+// 非法块返回错误且不记录。
+func TestMockDevice_UpgradeByMbus_InvalidBlock(t *testing.T) {
+	d := NewMockDevice()
+	if err := d.Connect(context.Background(), "COM9"); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	bad := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 4, Data: []byte("ABC")}
+	if err := d.UpgradeByMbus(context.Background(), "262601300011", bad); err == nil {
+		t.Fatal("非法升级块应返回错误")
+	}
+	if got := len(d.MockUpgradeBlocks()); got != 0 {
+		t.Fatalf("非法块不应被记录, 实际 %d", got)
+	}
+}
+
+// ---- 短写（short write）检测（oracle 复审）----
+
+// TestCommandTrans_ShortWrite 校验 Write 返回 n < len(frame) 且 err==nil 时
+// 视为写失败：立即返回 errMBusShortWrite（不可重试，防止半帧后重试把残帧
+// 追加到下一帧），且不再写第二次。
+func TestCommandTrans_ShortWrite(t *testing.T) {
+	frame, err := buildReadMotorFrame("262601300011")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := &fakePort{writeShortFrom: 1} // 第 1 次 Write 就短写（只写 1 字节）
+	d := NewMockDevice()
+	_, err = d.commandTrans(context.Background(), port, frame, time.Second, 3)
+	if !errors.Is(err, errMBusShortWrite) {
+		t.Fatalf("短写应返回 errMBusShortWrite, got %v", err)
+	}
+	if len(port.written) != 1 {
+		t.Fatalf("短写应立即返回不重试, 实际写 %d 次", len(port.written))
+	}
+	if got := len(port.written[0]); got != 1 {
+		t.Fatalf("短写帧应只写 1 字节, 实际 %d", got)
+	}
+}
+
+// TestRealDevice_UpgradeByMbus_DummyShortWrite 校验 dummy 唤醒帧短写时
+// UpgradeByMbus 报"升级唤醒帧发送失败"，且不再发送升级帧。
+func TestRealDevice_UpgradeByMbus_DummyShortWrite(t *testing.T) {
+	port := &fakePort{writeShortFrom: 1} // dummy 帧短写
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}
+	err := d.UpgradeByMbus(context.Background(), "262601300011", blk)
+	if err == nil || !strings.Contains(err.Error(), "升级唤醒帧发送失败") {
+		t.Fatalf("dummy 短写应报「升级唤醒帧发送失败」, got %v", err)
+	}
+	if len(port.written) != 1 {
+		t.Fatalf("dummy 短写后不应继续发送升级帧, 实际写 %d 次", len(port.written))
+	}
+}
+
+// TestRealDevice_UpgradeByMbus_BlockShortWrite 校验升级帧（BB20）短写时
+// UpgradeByMbus 报错（含"短写"），且短写后立即中止不重试。
+func TestRealDevice_UpgradeByMbus_BlockShortWrite(t *testing.T) {
+	port := &fakePort{writeShortFrom: 2} // 第 1 次（dummy）完整写，第 2 次（升级帧）短写
+	d := NewRealDevice()
+	d.mu.Lock()
+	d.port = port
+	d.mu.Unlock()
+	blk := UpgradeBlock{HardVer: 8, SoftVer: 5, BlockID: 1, BlockSize: 3, Data: []byte("ABC")}
+	err := d.UpgradeByMbus(context.Background(), "262601300011", blk)
+	if err == nil || !strings.Contains(err.Error(), "短写") {
+		t.Fatalf("BB20 短写应报错含「短写」, got %v", err)
+	}
+	// dummy 完整写 1 次 + 升级帧短写 1 次 = 2 次，短写后立即中止
+	if len(port.written) != 2 {
+		t.Fatalf("应写 dummy + 升级帧后中止, 实际写 %d 次", len(port.written))
+	}
+	if got := len(port.written[1]); got != 1 {
+		t.Fatalf("升级帧短写应只写 1 字节, 实际 %d", got)
 	}
 }

@@ -1,0 +1,7 @@
+# M-Bus 固件升级（Heat 套件）
+# PTVB1 文件名会启用三工位面板；三个工位分别选择串口，并发升级同一固件。
+- name: HeatSuite::wire_valve_mbus_upgrade_firmware
+  title: M-Bus 固件升级
+  case_seq: 1
+  counts: 1
+  desc: 通过 M-Bus 升级设备固件
